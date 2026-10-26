@@ -202,7 +202,9 @@ function QaagaAppShell() {
 
   // Active Chat State
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [selectedModelId, setSelectedModelId] = useState<string>('gpt-4o');
+  const [selectedModelId, setSelectedModelId] = useState<string>(
+    'gemini-3.1-flash-lite'
+  );
   const [reasoningEffort, setReasoningEffort] = useState<
     'low' | 'medium' | 'high'
   >('medium');
@@ -235,8 +237,12 @@ function QaagaAppShell() {
             data.config as PlatformConfigDTO
           ).models.filter((m) => m.enabled && m.available !== false);
           if (liveModels.length > 0) {
+            const preferredFast =
+              liveModels.find((m) => m.id === 'gpt-4o-mini') ||
+              liveModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+              liveModels[0];
             setSelectedModelId((prev) =>
-              liveModels.some((m) => m.id === prev) ? prev : liveModels[0].id
+              liveModels.some((m) => m.id === prev) ? prev : preferredFast.id
             );
           }
         }
@@ -566,36 +572,46 @@ function QaagaAppShell() {
       const decoder = new TextDecoder();
       let buffer = '';
 
+      const processGuestFrame = (frame: string) => {
+        const line = frame
+          .split('\n')
+          .find((l) => l.startsWith('data: '));
+        if (!line) return;
+
+        let event: { type?: string; text?: string; error?: string } | null = null;
+        try {
+          event = JSON.parse(line.slice(6));
+        } catch {
+          return;
+        }
+        if (!event) return;
+
+        if (event.type === 'delta' && event.text) {
+          finalReplyText += String(event.text);
+          setStreamingText(finalReplyText);
+        } else if (event.type === 'error') {
+          throw new Error(event.error || 'Guest chat streaming error.');
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) {
+            for (const trailing of buffer.split('\n\n')) {
+              processGuestFrame(trailing);
+            }
+          }
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
 
         const parts = buffer.split('\n\n');
         buffer = parts.pop() || '';
 
         for (const frame of parts) {
-          const line = frame
-            .split('\n')
-            .find((l) => l.startsWith('data: '));
-          if (!line) continue;
-
-          try {
-            const event = JSON.parse(line.slice(6));
-            if (event.type === 'delta' && event.text) {
-              finalReplyText += String(event.text);
-              setStreamingText(finalReplyText);
-            } else if (event.type === 'error') {
-              throw new Error(event.error || 'Streaming error.');
-            }
-          } catch (parseErr: unknown) {
-            if (
-              parseErr instanceof Error &&
-              parseErr.message !== 'Unexpected end of JSON input'
-            ) {
-              throw parseErr;
-            }
-          }
+          processGuestFrame(frame);
         }
       }
 
@@ -615,8 +631,14 @@ function QaagaAppShell() {
           createdAt: new Date().toISOString(),
         };
         setGuestMessages((prev) => [...prev, assistantMsg]);
+      } else {
+        throw new Error('Empty response received. Please try sending your message again.');
       }
     } catch (err: unknown) {
+      if (!finalReplyText.trim()) {
+        setGuestMessages(historySnapshot);
+        setChatInput(promptToSend);
+      }
       setStreamError(
         err instanceof Error ? err.message : 'Guest chat interrupted.'
       );
@@ -871,42 +893,57 @@ function QaagaAppShell() {
       const decoder = new TextDecoder();
       let buffer = '';
 
+      const processAuthFrame = (frame: string) => {
+        const line = frame
+          .split('\n')
+          .find((l) => l.startsWith('data: '));
+        if (!line) return;
+
+        let event: {
+          type?: string;
+          sessionId?: number;
+          text?: string;
+          error?: string;
+        } | null = null;
+        try {
+          event = JSON.parse(line.slice(6));
+        } catch {
+          return;
+        }
+        if (!event) return;
+
+        if (event.type === 'meta' && event.sessionId) {
+          resolvedSessionId = Number(event.sessionId);
+          setActiveSessionId(resolvedSessionId);
+        } else if (event.type === 'delta' && event.text) {
+          finalReplyText += String(event.text);
+          setStreamingText(finalReplyText);
+        } else if (event.type === 'error') {
+          throw new Error(event.error || 'Provider streaming error.');
+        } else if (event.type === 'done' && event.sessionId) {
+          resolvedSessionId = Number(event.sessionId);
+          setActiveSessionId(resolvedSessionId);
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) {
+            for (const trailing of buffer.split('\n\n')) {
+              processAuthFrame(trailing);
+            }
+          }
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
 
         const parts = buffer.split('\n\n');
         buffer = parts.pop() || '';
 
         for (const frame of parts) {
-          const line = frame
-            .split('\n')
-            .find((l) => l.startsWith('data: '));
-          if (!line) continue;
-
-          try {
-            const event = JSON.parse(line.slice(6));
-            if (event.type === 'meta' && event.sessionId) {
-              resolvedSessionId = Number(event.sessionId);
-              setActiveSessionId(resolvedSessionId);
-            } else if (event.type === 'delta' && event.text) {
-              finalReplyText += String(event.text);
-              setStreamingText(finalReplyText);
-            } else if (event.type === 'error') {
-              throw new Error(event.error || 'Provider streaming error.');
-            } else if (event.type === 'done' && event.sessionId) {
-              resolvedSessionId = Number(event.sessionId);
-              setActiveSessionId(resolvedSessionId);
-            }
-          } catch (parseErr: unknown) {
-            if (
-              parseErr instanceof Error &&
-              parseErr.message !== 'Unexpected end of JSON input'
-            ) {
-              throw parseErr;
-            }
-          }
+          processAuthFrame(frame);
         }
       }
 

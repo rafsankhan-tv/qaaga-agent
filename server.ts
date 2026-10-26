@@ -78,7 +78,7 @@ async function startServer() {
   const aiLimiter = createRateLimiter(45, 60_000);
   const paymentLimiter = createRateLimiter(12, 60_000);
 
-  const guestChatLimiter = createRateLimiter(25, 60_000);
+  const guestChatLimiter = createRateLimiter(40, 60_000);
 
   const sendCommandError = (res: express.Response, err: unknown, fallback: string) => {
     const raw = err instanceof Error ? err.message : fallback;
@@ -216,13 +216,18 @@ async function startServer() {
 
       const { enrichedConfig } = await enrichConfigWithLiveAvailability(rawConfig);
 
-      const chosenModel =
-        enrichedConfig.models.find(
-          (m) => m.id === modelId && m.enabled && m.available !== false
-        ) ||
-        enrichedConfig.models.find((m) => m.enabled && m.available !== false) ||
+      const liveAvailableModels = enrichedConfig.models.filter(
+        (m) => m.enabled && m.available !== false
+      );
+      const fastGuestDefault =
+        liveAvailableModels.find((m) => m.id === 'gpt-4o-mini') ||
+        liveAvailableModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+        liveAvailableModels[0] ||
         enrichedConfig.models.find((m) => m.enabled) ||
         enrichedConfig.models[0];
+
+      const chosenModel =
+        liveAvailableModels.find((m) => m.id === modelId) || fastGuestDefault;
 
       const safeHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
         Array.isArray(history)
@@ -239,11 +244,21 @@ async function startServer() {
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders?.();
 
       const sendSSE = (obj: Record<string, unknown>) => {
-        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        }
       };
+
+      const heartbeatTimer = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(`: heartbeat\n\n`);
+        }
+      }, 5000);
+      res.on('close', () => clearInterval(heartbeatTimer));
 
       sendSSE({ type: 'meta', model: chosenModel.id });
 
@@ -255,7 +270,7 @@ async function startServer() {
           webSearch: false,
           reasoningEffort: ['low', 'medium', 'high'].includes(reasoningEffort)
             ? reasoningEffort
-            : 'medium',
+            : 'low',
           userFullName: 'Guest Visitor',
           onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
         });
@@ -263,9 +278,12 @@ async function startServer() {
         sendSSE({
           type: 'done',
           tokensUsed: result.totalTokens,
+          modelUsed: result.modelUsed,
         });
+        clearInterval(heartbeatTimer);
         res.end();
       } catch (streamErr: unknown) {
+        clearInterval(heartbeatTimer);
         const errMeta = extractProviderErrorMeta(streamErr);
         await recordProviderApiError({
           actorUserId: null,
@@ -1008,11 +1026,21 @@ async function startServer() {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
         res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
         res.flushHeaders?.();
 
         const sendSSE = (obj: Record<string, unknown>) => {
-          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify(obj)}\n\n`);
+          }
         };
+
+        const authHeartbeatTimer = setInterval(() => {
+          if (!res.writableEnded) {
+            res.write(`: heartbeat\n\n`);
+          }
+        }, 5000);
+        res.on('close', () => clearInterval(authHeartbeatTimer));
 
         sendSSE({
           type: 'meta',
@@ -1102,8 +1130,10 @@ async function startServer() {
             modelUsed: result.modelUsed,
             citations: result.citations,
           });
+          clearInterval(authHeartbeatTimer);
           res.end();
         } catch (streamErr: unknown) {
+          clearInterval(authHeartbeatTimer);
           // Full Atomic Refund on AI Provider Failure!
           await finalizeCreditReservation({
             userId: authUser.id,

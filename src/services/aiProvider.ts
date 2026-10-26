@@ -132,30 +132,74 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-function isTransientOverload(err: unknown): boolean {
-  const status = (err as { status?: number })?.status;
-  return status === 502 || status === 503 || status === 504;
-}
-
 export function extractProviderErrorMeta(err: unknown): {
   status: number | null;
   errorCode: string;
   safeMessage: string;
 } {
-  const status = (err as { status?: number })?.status || null;
-  const errorCode =
+  let status: number | null = (err as { status?: number })?.status || null;
+  let errorCode =
     (err as { code?: string; error?: { code?: string } })?.code ||
     (err as { error?: { code?: string } })?.error?.code ||
-    (status ? `http_${status}` : 'provider_error');
-  const rawMsg =
+    '';
+  let rawMsg =
     (err as { error?: { message?: string }; message?: string })?.error
       ?.message ||
-    (err instanceof Error ? err.message : String(err || 'Unknown provider error'));
+    (err instanceof Error
+      ? err.message
+      : String(err || 'Unknown provider error'));
+
+  // Unwrap JSON-formatted SDK error payloads such as {"error":{"code":503,"message":"...","status":"UNAVAILABLE"}}
+  const trimmed = rawMsg.trim();
+  if (trimmed.startsWith('{') || trimmed.includes('"error":{')) {
+    const jsonStart = trimmed.indexOf('{');
+    if (jsonStart !== -1) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(jsonStart)) as {
+          error?: { code?: number | string; message?: string; status?: string };
+        };
+        if (parsed?.error) {
+          if (!status && typeof parsed.error.code === 'number') {
+            status = parsed.error.code;
+          }
+          if (!errorCode && parsed.error.status) {
+            errorCode = String(parsed.error.status).toLowerCase();
+          }
+          if (parsed.error.message) {
+            rawMsg = parsed.error.message;
+          }
+        }
+      } catch {
+        // Keep rawMsg if not valid JSON
+      }
+    }
+  }
+
+  if (
+    !status &&
+    ((err as { name?: string })?.name === 'AbortError' ||
+      /aborted|first-token timeout/i.test(rawMsg))
+  ) {
+    status = 504;
+    errorCode = errorCode || 'first_token_timeout';
+  }
+
   return {
     status,
-    errorCode: String(errorCode),
+    errorCode: String(errorCode || (status ? `http_${status}` : 'provider_error')),
     safeMessage: redactSecrets(rawMsg),
   };
+}
+
+function isTransientOverload(err: unknown): boolean {
+  const { status, errorCode } = extractProviderErrorMeta(err);
+  return (
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    errorCode === 'unavailable' ||
+    errorCode === 'first_token_timeout'
+  );
 }
 
 function formatOpenAIError(err: unknown, contextLabel: string): Error {
@@ -199,6 +243,11 @@ function formatGeminiError(err: unknown, contextLabel: string): Error {
   if (status === 429) {
     return new Error(
       `${contextLabel} rate-limited by Google Gemini (HTTP 429): Please retry shortly. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 503 || status === 502 || status === 504) {
+    return new Error(
+      `${contextLabel} temporarily overloaded (HTTP ${status}): ${safeMessage}`
     );
   }
   return new Error(`${contextLabel} error: ${safeMessage}`);
@@ -1085,74 +1134,113 @@ async function streamGeminiChatCompletion(
     parts: currentParts,
   });
 
-  const runGeminiStream = async () => {
-    const configObj: Record<string, unknown> = {
-      systemInstruction,
-    };
+  let emittedAnyDelta = false;
 
-    if (opts.webSearch) {
-      configObj.tools = [{ googleSearch: {} }];
-    }
+  const runGeminiStream = async (modelToCall: string, firstTokenTimeoutMs: number) => {
+    const controller = new AbortController();
+    const firstTokenTimer = setTimeout(() => {
+      if (!emittedAnyDelta) {
+        controller.abort(
+          new Error(`Gemini ${modelToCall} first-token timeout after ${firstTokenTimeoutMs}ms`)
+        );
+      }
+    }, firstTokenTimeoutMs);
 
-    if (targetModel === 'gemini-3.8-flash' && opts.reasoningEffort === 'high') {
-      configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
-    } else if (targetModel === 'gemini-3.8-flash') {
-      configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-    }
+    try {
+      const configObj: Record<string, unknown> = {
+        systemInstruction,
+        abortSignal: controller.signal,
+      };
 
-    const responseStream = await ai.models.generateContentStream({
-      model: targetModel,
-      contents,
-      config: configObj,
-    });
-
-    let fullText = '';
-    let promptTokens = 0;
-    let completionTokens = 0;
-    const citationMap = new Map<string, GroundingLink>();
-
-    for await (const rawChunk of responseStream) {
-      const chunk = rawChunk as GenerateContentResponse;
-      const deltaText = chunk.text;
-      if (deltaText) {
-        fullText += deltaText;
-        opts.onDelta(deltaText);
+      if (opts.webSearch) {
+        configObj.tools = [{ googleSearch: {} }];
       }
 
-      const groundingChunks =
-        chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (Array.isArray(groundingChunks)) {
-        for (const g of groundingChunks) {
-          const web = (g as { web?: { uri?: string; title?: string } })?.web;
-          if (web?.uri) {
-            citationMap.set(web.uri, {
-              uri: web.uri,
-              title: web.title || web.uri,
-            });
+      if (modelToCall === 'gemini-3.8-flash' && opts.reasoningEffort === 'high') {
+        configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
+      } else if (modelToCall === 'gemini-3.8-flash') {
+        configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+      }
+
+      const responseStream = await ai.models.generateContentStream({
+        model: modelToCall,
+        contents,
+        config: configObj,
+      });
+
+      let fullText = '';
+      let promptTokens = 0;
+      let completionTokens = 0;
+      const citationMap = new Map<string, GroundingLink>();
+
+      for await (const rawChunk of responseStream) {
+        clearTimeout(firstTokenTimer);
+        const chunk = rawChunk as GenerateContentResponse;
+        const deltaText = chunk.text;
+        if (deltaText) {
+          emittedAnyDelta = true;
+          fullText += deltaText;
+          opts.onDelta(deltaText);
+        }
+
+        const groundingChunks =
+          chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+        if (Array.isArray(groundingChunks)) {
+          for (const g of groundingChunks) {
+            const web = (g as { web?: { uri?: string; title?: string } })?.web;
+            if (web?.uri) {
+              citationMap.set(web.uri, {
+                uri: web.uri,
+                title: web.title || web.uri,
+              });
+            }
           }
+        }
+
+        if (chunk.usageMetadata) {
+          promptTokens = chunk.usageMetadata.promptTokenCount || promptTokens;
+          completionTokens =
+            chunk.usageMetadata.candidatesTokenCount || completionTokens;
         }
       }
 
-      if (chunk.usageMetadata) {
-        promptTokens = chunk.usageMetadata.promptTokenCount || promptTokens;
-        completionTokens =
-          chunk.usageMetadata.candidatesTokenCount || completionTokens;
-      }
+      return {
+        fullText,
+        citations: Array.from(citationMap.values()),
+        promptTokens,
+        completionTokens,
+        modelUsed: modelToCall,
+      };
+    } finally {
+      clearTimeout(firstTokenTimer);
     }
-
-    return {
-      fullText,
-      citations: Array.from(citationMap.values()),
-      promptTokens,
-      completionTokens,
-    };
   };
 
   try {
-    const outcome = await withOverloadRetry(
-      runGeminiStream,
-      (e) => formatGeminiError(e, 'Google Gemini Chat Stream')
-    );
+    let outcome: Awaited<ReturnType<typeof runGeminiStream>>;
+    try {
+      outcome = await runGeminiStream(
+        targetModel,
+        targetModel === 'gemini-3.8-flash' ? 10_000 : 22_000
+      );
+    } catch (primaryErr: unknown) {
+      const { status } = extractProviderErrorMeta(primaryErr);
+      const canSameProviderFallback =
+        !emittedAnyDelta &&
+        targetModel !== 'gemini-3.1-flash-lite' &&
+        (isTransientOverload(primaryErr) || status === 429);
+
+      if (canSameProviderFallback) {
+        outcome = await withOverloadRetry(
+          () => runGeminiStream('gemini-3.1-flash-lite', 20_000),
+          (e) => formatGeminiError(e, 'Google Gemini Chat Stream')
+        );
+      } else if (!emittedAnyDelta && isTransientOverload(primaryErr)) {
+        outcome = await runGeminiStream(targetModel, 22_000);
+      } else {
+        throw formatGeminiError(primaryErr, 'Google Gemini Chat Stream');
+      }
+    }
 
     const promptTokens =
       outcome.promptTokens > 0
@@ -1165,7 +1253,7 @@ async function streamGeminiChatCompletion(
     const totalTokens = promptTokens + completionTokens;
 
     const providerCostUsd = calculateProviderCostUsd(
-      targetModel,
+      outcome.modelUsed,
       promptTokens,
       completionTokens,
       'gemini',
@@ -1182,7 +1270,7 @@ async function streamGeminiChatCompletion(
       completionTokens,
       totalTokens,
       providerUsed: 'gemini',
-      modelUsed: targetModel,
+      modelUsed: outcome.modelUsed,
       providerCostUsd,
     };
   } catch (err: unknown) {
