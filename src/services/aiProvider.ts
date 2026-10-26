@@ -1,117 +1,129 @@
 import OpenAI from 'openai';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
-import type { GenerateContentResponse } from '@google/genai';
+import {
+  GoogleGenAI,
+  GenerateContentResponse,
+  LiveServerMessage,
+  Modality,
+  ThinkingLevel,
+} from '@google/genai';
 import type {
   GroundingLink,
   ModelConfigItem,
+  OpenAIAccountDiscoveryDTO,
   PlatformConfigDTO,
   ProviderCapabilitiesDTO,
+  ProviderDiagnosticsDTO,
 } from '../types/qaaga.ts';
 
-// Official OpenAI Standard API Pricing (USD per 1M tokens) — never fabricated
+// Official OpenAI Standard API Pricing (USD per 1M tokens)
 export const OPENAI_PRICING_USD_PER_1M: Record<
   string,
   { input: number; output: number }
 > = {
-  'gpt-4o': { input: 2.5, output: 10.0 },
-  'gpt-4o-mini': { input: 0.15, output: 0.6 },
+  o3: { input: 2.0, output: 8.0 },
   'o3-mini': { input: 1.1, output: 4.4 },
+  'o4-mini': { input: 1.1, output: 4.4 },
+  o1: { input: 15.0, output: 60.0 },
+  'gpt-4o': { input: 2.5, output: 10.0 },
+  'gpt-4.1': { input: 2.0, output: 8.0 },
+  'gpt-4o-mini': { input: 0.15, output: 0.6 },
+  'gpt-4.1-mini': { input: 0.4, output: 1.6 },
+  'gpt-4.1-nano': { input: 0.1, output: 0.4 },
   'gpt-4o-search-preview': { input: 2.5, output: 10.0 },
+  'gpt-4o-mini-search-preview': { input: 0.15, output: 0.6 },
 };
 
+// Google Gemini Standard API Pricing Estimate (USD per 1M tokens) — tracked separately from OpenAI USD
+export const GEMINI_PRICING_USD_PER_1M: Record<
+  string,
+  { input: number; output: number }
+> = {
+  'gemini-3.8-flash': { input: 0.15, output: 0.6 },
+  'gemini-flash-latest': { input: 0.15, output: 0.6 },
+  'gemini-3.1-flash-lite': { input: 0.075, output: 0.3 },
+  'gemini-3.5-transcribe': { input: 0.1, output: 0.4 },
+  'gemini-3.8-flash-lite-tts': { input: 0.1, output: 0.4 },
+  'gemini-3.8-live': { input: 0.35, output: 1.5 },
+};
+
+const PLACEHOLDER_KEYS = new Set([
+  'MY_OPENAI_API_KEY',
+  'YOUR_OPENAI_API_KEY',
+  'REPLACE_WITH_OPENAI_API_KEY',
+  'MY_GEMINI_API_KEY',
+  'YOUR_GEMINI_API_KEY',
+]);
+
+function getServerOpenAIKey(): string {
+  return (process.env.OPENAI_API_KEY || '').trim();
+}
+
+function getServerGeminiKey(): string {
+  return (process.env.GEMINI_API_KEY || '').trim();
+}
+
+/**
+ * Redacts any API key or token pattern so secret fragments are NEVER exposed
+ * in logs, audit entries, SSE frames, WebSocket events, or HTTP responses.
+ */
+export function redactSecrets(input: string): string {
+  const openAiKey = getServerOpenAIKey();
+  const geminiKey = getServerGeminiKey();
+  let sanitized = input || '';
+  if (openAiKey && openAiKey.length >= 4) {
+    sanitized = sanitized.split(openAiKey).join('[REDACTED]');
+  }
+  if (geminiKey && geminiKey.length >= 4) {
+    sanitized = sanitized.split(geminiKey).join('[REDACTED]');
+  }
+  return sanitized
+    .replace(/sk-[A-Za-z0-9._*-]{2,}/g, '[REDACTED_OPENAI_KEY]')
+    .replace(/AIza[A-Za-z0-9_-]{8,}/g, '[REDACTED_GEMINI_KEY]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]');
+}
+
 export function isOpenAIConfigured(): boolean {
-  const key = process.env.OPENAI_API_KEY?.trim();
-  return Boolean(key && key !== 'MY_OPENAI_API_KEY' && key.length > 12);
+  const key = getServerOpenAIKey();
+  return Boolean(key && !PLACEHOLDER_KEYS.has(key));
 }
 
-export function isGeminiBridgeConfigured(): boolean {
-  const key = process.env.GEMINI_API_KEY?.trim();
-  return Boolean(key && key !== 'MY_GEMINI_API_KEY' && key.length > 10);
+export function isGeminiConfigured(): boolean {
+  const key = getServerGeminiKey();
+  return Boolean(key && !PLACEHOLDER_KEYS.has(key));
 }
 
-export function getProviderCapabilities(
-  config: PlatformConfigDTO
-): ProviderCapabilitiesDTO {
-  const openaiReady = isOpenAIConfigured();
-  const geminiReady = isGeminiBridgeConfigured();
-  const activeMode = openaiReady
-    ? 'openai-live'
-    : geminiReady
-    ? 'sandbox-bridge'
-    : 'demo-simulation';
-
+export function getOpenAIRealtimeAuthHeaders(): Record<string, string> {
+  const apiKey = getServerOpenAIKey();
+  if (!apiKey || PLACEHOLDER_KEYS.has(apiKey)) {
+    throw new Error(
+      'OPENAI_API_KEY is not configured on the server. Add it in Settings > Secrets.'
+    );
+  }
   return {
-    openaiConfigured: openaiReady,
-    geminiBridgeConfigured: geminiReady,
-    activeMode,
-    features: {
-      chatStreaming: {
-        available: true,
-        provider: openaiReady
-          ? 'OpenAI API (Live)'
-          : geminiReady
-          ? 'Server Bridge (OPENAI_API_KEY unconfigured)'
-          : 'Labeled Demo Mode',
-        note: openaiReady
-          ? 'Direct OpenAI Responses/Chat streaming active'
-          : 'Set OPENAI_API_KEY in Secrets to switch from Sandbox Bridge to direct OpenAI billing',
-      },
-      imageGeneration: {
-        available: config.toolsEnabled.imageGeneration,
-        provider: openaiReady
-          ? 'OpenAI gpt-image-1 / dall-e-3'
-          : geminiReady
-          ? 'Vector Synthesis Bridge (OpenAI unconfigured)'
-          : 'Demo Vector Mode',
-        note: config.toolsEnabled.imageGeneration
-          ? 'Enabled by administrator'
-          : 'Disabled by administrator',
-      },
-      imageAnalysis: {
-        available: config.toolsEnabled.imageAnalysis && (openaiReady || geminiReady),
-        provider: openaiReady ? 'OpenAI Vision' : 'Multimodal Vision Bridge',
-        note: 'Supports PNG, JPEG, WEBP inline visual inspection',
-      },
-      pdfAnalysis: {
-        available: config.toolsEnabled.pdfAnalysis && (openaiReady || geminiReady),
-        provider: openaiReady ? 'OpenAI Document Extraction' : 'Multimodal PDF Bridge',
-        note: 'Supports PDF, TXT, CSV, Markdown summarization & Q&A',
-      },
-      webSearch: {
-        available: config.toolsEnabled.webSearch && (openaiReady || geminiReady),
-        provider: openaiReady
-          ? 'OpenAI Search Preview'
-          : geminiReady
-          ? 'Google Search Grounding Bridge'
-          : 'Unconfigured',
-        note:
-          openaiReady || geminiReady
-            ? 'Live web citations enabled'
-            : 'Configure API credentials to enable live web search',
-      },
-      speechToText: {
-        available: config.toolsEnabled.voiceChat && (openaiReady || geminiReady),
-        provider: openaiReady ? 'OpenAI Whisper-1' : 'Gemini 3.5 Transcribe Bridge',
-        note: 'Supports English & Bengali microphone dictation',
-      },
-      textToSpeech: {
-        available: config.toolsEnabled.voiceChat && (openaiReady || geminiReady),
-        provider: openaiReady ? 'OpenAI TTS-1' : 'Neural 24kHz WAV TTS Bridge',
-        note: 'Spoken audio synthesis for assistant responses',
-      },
-    },
+    Authorization: `Bearer ${apiKey}`,
+    'OpenAI-Beta': 'realtime=v1',
   };
 }
 
 function getOpenAIClient(): OpenAI {
-  return new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
+  const apiKey = getServerOpenAIKey();
+  if (!apiKey || PLACEHOLDER_KEYS.has(apiKey)) {
+    throw new Error(
+      'OpenAI API key is not configured on the server. Add a valid OPENAI_API_KEY in Settings > Secrets.'
+    );
+  }
+  return new OpenAI({ apiKey });
 }
 
 function getGeminiClient(): GoogleGenAI {
+  const apiKey = getServerGeminiKey();
+  if (!apiKey || PLACEHOLDER_KEYS.has(apiKey)) {
+    throw new Error(
+      'Google Gemini API key is not configured on the server. Check GEMINI_API_KEY in Settings > Secrets.'
+    );
+  }
   return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -120,20 +132,577 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-export function calculateOpenAICostUsd(
+function isTransientOverload(err: unknown): boolean {
+  const status = (err as { status?: number })?.status;
+  return status === 502 || status === 503 || status === 504;
+}
+
+export function extractProviderErrorMeta(err: unknown): {
+  status: number | null;
+  errorCode: string;
+  safeMessage: string;
+} {
+  const status = (err as { status?: number })?.status || null;
+  const errorCode =
+    (err as { code?: string; error?: { code?: string } })?.code ||
+    (err as { error?: { code?: string } })?.error?.code ||
+    (status ? `http_${status}` : 'provider_error');
+  const rawMsg =
+    (err as { error?: { message?: string }; message?: string })?.error
+      ?.message ||
+    (err instanceof Error ? err.message : String(err || 'Unknown provider error'));
+  return {
+    status,
+    errorCode: String(errorCode),
+    safeMessage: redactSecrets(rawMsg),
+  };
+}
+
+function formatOpenAIError(err: unknown, contextLabel: string): Error {
+  const { status, errorCode, safeMessage } = extractProviderErrorMeta(err);
+
+  if (status === 401 || errorCode === 'invalid_api_key') {
+    return new Error(
+      `${contextLabel} failed (OpenAI HTTP 401 — Invalid API Key): Please configure a valid, full-length OPENAI_API_KEY in Settings > Secrets. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 429 && errorCode === 'insufficient_quota') {
+    return new Error(
+      `${contextLabel} failed (OpenAI HTTP 429 — Insufficient Quota): Your OpenAI API billing account has exceeded its current quota. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 429) {
+    return new Error(
+      `${contextLabel} rate-limited by OpenAI (HTTP 429): Please retry in a moment. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 403 || status === 404 || errorCode === 'model_not_found') {
+    return new Error(
+      `${contextLabel} failed (OpenAI HTTP ${status || 404}): This OpenAI model or capability is not unlocked on your API account tier. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 503 || status === 502 || status === 504) {
+    return new Error(
+      `${contextLabel} temporarily unavailable from OpenAI (HTTP ${status}). Any reserved credits were refunded.`
+    );
+  }
+  return new Error(`${contextLabel} error: ${safeMessage}`);
+}
+
+function formatGeminiError(err: unknown, contextLabel: string): Error {
+  const { status, safeMessage } = extractProviderErrorMeta(err);
+  if (status === 401 || status === 403) {
+    return new Error(
+      `${contextLabel} failed (Gemini HTTP ${status}): Check GEMINI_API_KEY permissions in Settings > Secrets. Any reserved credits were refunded.`
+    );
+  }
+  if (status === 429) {
+    return new Error(
+      `${contextLabel} rate-limited by Google Gemini (HTTP 429): Please retry shortly. Any reserved credits were refunded.`
+    );
+  }
+  return new Error(`${contextLabel} error: ${safeMessage}`);
+}
+
+async function withOverloadRetry<T>(
+  fn: () => Promise<T>,
+  formatter: (err: unknown) => Error,
+  maxAttempts = 2
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      lastErr = err;
+      if (!isTransientOverload(err) || attempt === maxAttempts - 1) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+  }
+  throw formatter(lastErr);
+}
+
+// ============================================================================
+// DYNAMIC OPENAI ACCOUNT MODEL DISCOVERY (Cached 60s to avoid per-request latency)
+// ============================================================================
+let cachedDiscovery: {
+  keyFingerprint: string;
+  expiresAt: number;
+  data: OpenAIAccountDiscoveryDTO;
+  rawModelIds: Set<string>;
+} | null = null;
+
+function fingerprintKey(k: string): string {
+  if (!k) return 'none';
+  return `${k.length}:${k.charCodeAt(0)}:${k.charCodeAt(k.length - 1)}`;
+}
+
+function emptyCategorizedModels(): OpenAIAccountDiscoveryDTO['categorizedModels'] {
+  return {
+    reasoning: [],
+    standard: [],
+    economical: [],
+    image: [],
+    audio: [],
+    realtime: [],
+    search: [],
+  };
+}
+
+export async function discoverOpenAIAccountModels(
+  forceRefresh = false
+): Promise<{
+  discovery: OpenAIAccountDiscoveryDTO;
+  rawModelIds: Set<string>;
+}> {
+  const rawKey = getServerOpenAIKey();
+  const fp = fingerprintKey(rawKey);
+
+  if (
+    !forceRefresh &&
+    cachedDiscovery &&
+    cachedDiscovery.keyFingerprint === fp &&
+    cachedDiscovery.expiresAt > Date.now()
+  ) {
+    return {
+      discovery: cachedDiscovery.data,
+      rawModelIds: cachedDiscovery.rawModelIds,
+    };
+  }
+
+  if (!rawKey || PLACEHOLDER_KEYS.has(rawKey)) {
+    const empty: OpenAIAccountDiscoveryDTO = {
+      checkedAt: new Date().toISOString(),
+      keyPresent: false,
+      reachable: false,
+      status: null,
+      errorCode: 'missing_api_key',
+      message:
+        'OPENAI_API_KEY is not set in server environment variables. Configure it in Settings > Secrets to unlock OpenAI models.',
+      totalModelsCount: 0,
+      categorizedModels: emptyCategorizedModels(),
+    };
+    cachedDiscovery = {
+      keyFingerprint: fp,
+      expiresAt: Date.now() + 30_000,
+      data: empty,
+      rawModelIds: new Set(),
+    };
+    return { discovery: empty, rawModelIds: new Set() };
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey: rawKey });
+    const list = await openai.models.list();
+    const ids = list.data.map((m) => m.id).sort();
+    const rawSet = new Set(ids);
+
+    const pick = (candidates: string[]) =>
+      candidates.filter((id) => rawSet.has(id));
+
+    const categorized: OpenAIAccountDiscoveryDTO['categorizedModels'] = {
+      reasoning: pick(['o3', 'o4-mini', 'o3-mini', 'o1', 'o1-pro', 'o1-mini']),
+      standard: pick(['gpt-4.1', 'gpt-4o', 'gpt-4.5-preview', 'chatgpt-4o-latest']),
+      economical: pick(['gpt-4.1-mini', 'gpt-4o-mini', 'gpt-4.1-nano']),
+      image: pick(['gpt-image-1', 'dall-e-3', 'dall-e-2']),
+      audio: pick([
+        'gpt-4o-mini-transcribe',
+        'gpt-4o-transcribe',
+        'whisper-1',
+        'gpt-4o-mini-tts',
+        'tts-1',
+        'tts-1-hd',
+      ]),
+      realtime: pick([
+        'gpt-4o-realtime-preview',
+        'gpt-4o-mini-realtime-preview',
+      ]),
+      search: pick(['gpt-4o-search-preview', 'gpt-4o-mini-search-preview']),
+    };
+
+    const data: OpenAIAccountDiscoveryDTO = {
+      checkedAt: new Date().toISOString(),
+      keyPresent: true,
+      reachable: true,
+      status: 200,
+      errorCode: null,
+      message: `Verified ${ids.length} official OpenAI API models accessible to your API key.`,
+      totalModelsCount: ids.length,
+      categorizedModels: categorized,
+    };
+
+    cachedDiscovery = {
+      keyFingerprint: fp,
+      expiresAt: Date.now() + 60_000,
+      data,
+      rawModelIds: rawSet,
+    };
+    return { discovery: data, rawModelIds: rawSet };
+  } catch (err: unknown) {
+    const { status, errorCode } = extractProviderErrorMeta(err);
+    const formatted = formatOpenAIError(err, 'OpenAI Account Discovery');
+    const failed: OpenAIAccountDiscoveryDTO = {
+      checkedAt: new Date().toISOString(),
+      keyPresent: true,
+      reachable: false,
+      status,
+      errorCode,
+      message: formatted.message,
+      totalModelsCount: 0,
+      categorizedModels: emptyCategorizedModels(),
+    };
+    cachedDiscovery = {
+      keyFingerprint: fp,
+      expiresAt: Date.now() + 30_000,
+      data: failed,
+      rawModelIds: new Set(),
+    };
+    return { discovery: failed, rawModelIds: new Set() };
+  }
+}
+
+/**
+ * Enriches configured models with live provider availability so the Model Selector
+ * shows ONLY supported and currently accessible models to end users, while allowing
+ * Administrators to inspect and configure all OpenAI & Gemini models.
+ */
+export async function enrichConfigWithLiveAvailability(
+  config: PlatformConfigDTO,
+  forceRefresh = false
+): Promise<{
+  enrichedConfig: PlatformConfigDTO;
+  capabilities: ProviderCapabilitiesDTO;
+}> {
+  const { discovery, rawModelIds } = await discoverOpenAIAccountModels(
+    forceRefresh
+  );
+  const geminiReady = isGeminiConfigured();
+  const openaiLive = discovery.reachable;
+
+  const enrichedModels: ModelConfigItem[] = config.models.map((m) => {
+    const normalizedProvider: 'openai' | 'gemini' =
+      m.provider === 'gemini' || m.provider === 'bridge' ? 'gemini' : 'openai';
+
+    const inferredTier =
+      m.tier ||
+      (normalizedProvider === 'gemini'
+        ? 'gemini'
+        : m.category === 'reasoning' ||
+          m.id.startsWith('o3') ||
+          m.id.startsWith('o4') ||
+          m.id.startsWith('o1')
+        ? 'openai-reasoning'
+        : m.id.includes('mini') || m.id.includes('nano')
+        ? 'openai-economical'
+        : 'openai-standard');
+
+    if (normalizedProvider === 'gemini') {
+      return {
+        ...m,
+        provider: 'gemini',
+        tier: 'gemini',
+        available: geminiReady,
+        availabilityNote: geminiReady
+          ? 'Live via Google Gemini API (Server-Side)'
+          : 'GEMINI_API_KEY not configured in Settings > Secrets',
+      };
+    }
+
+    // OpenAI model: check live account access
+    const modelUnlocked = openaiLive && rawModelIds.has(m.id);
+    let availabilityNote = 'Verified accessible on OpenAI API account';
+    if (!discovery.keyPresent) {
+      availabilityNote = 'OPENAI_API_KEY not set in Settings > Secrets';
+    } else if (!openaiLive) {
+      availabilityNote = `OpenAI API unreachable (${
+        discovery.status ? `HTTP ${discovery.status}` : discovery.errorCode || 'auth error'
+      })`;
+    } else if (!modelUnlocked) {
+      availabilityNote =
+        'Not unlocked on this OpenAI API account tier (API tiers are separate from ChatGPT Pro subscriptions)';
+    }
+
+    return {
+      ...m,
+      provider: 'openai',
+      tier: inferredTier,
+      available: modelUnlocked,
+      availabilityNote,
+    };
+  });
+
+  const anyChatReady = openaiLive || geminiReady;
+  const openaiImageReady =
+    openaiLive &&
+    (rawModelIds.has('dall-e-3') || rawModelIds.has('gpt-image-1'));
+  const openaiRealtimeReady =
+    openaiLive &&
+    (rawModelIds.has('gpt-4o-realtime-preview') ||
+      rawModelIds.has('gpt-4o-mini-realtime-preview'));
+  const openaiReasoningReady =
+    openaiLive && discovery.categorizedModels.reasoning.length > 0;
+
+  const activeMode: ProviderCapabilitiesDTO['activeMode'] =
+    openaiLive && geminiReady
+      ? 'multi-provider-live'
+      : openaiLive
+      ? 'openai-live'
+      : geminiReady
+      ? 'gemini-live'
+      : 'demo-simulation';
+
+  const capabilities: ProviderCapabilitiesDTO = {
+    openaiConfigured: discovery.keyPresent,
+    openaiLiveVerified: openaiLive,
+    geminiConfigured: geminiReady,
+    geminiBridgeConfigured: geminiReady,
+    activeMode,
+    openaiDiscovery: discovery,
+    features: {
+      chatStreaming: {
+        available: anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Official API + Google Gemini API'
+            : openaiLive
+            ? 'OpenAI Official API (Streaming)'
+            : geminiReady
+            ? 'Google Gemini API (gemini-3.8-flash / gemini-3.1-flash-lite)'
+            : 'Unconfigured',
+        note:
+          openaiLive && geminiReady
+            ? 'Multi-provider streaming active with strict provider isolation'
+            : geminiReady && !openaiLive
+            ? `Google Gemini live; OpenAI requires valid OPENAI_API_KEY (${
+                discovery.status ? `HTTP ${discovery.status}` : 'not verified'
+              })`
+            : 'Server-side AI streaming',
+      },
+      reasoning: {
+        available: openaiReasoningReady || geminiReady,
+        provider: openaiReasoningReady
+          ? `OpenAI Reasoning (${discovery.categorizedModels.reasoning.join(', ')}) + Gemini Thinking`
+          : geminiReady
+          ? 'Google Gemini Thinking (gemini-3.8-flash)'
+          : 'Unconfigured',
+        note: openaiReasoningReady
+          ? 'OpenAI o-series reasoning models verified on API account'
+          : 'OpenAI o-series unlocks when a valid OPENAI_API_KEY with tier access is configured; Gemini Thinking is active',
+      },
+      imageGeneration: {
+        available: config.toolsEnabled.imageGeneration && openaiImageReady,
+        provider: openaiImageReady
+          ? 'OpenAI Official Images API (dall-e-3 / gpt-image-1)'
+          : 'Requires Valid OpenAI API Key (dall-e-3)',
+        note: !config.toolsEnabled.imageGeneration
+          ? 'Disabled by administrator'
+          : openaiImageReady
+          ? 'Official OpenAI image synthesis active'
+          : 'Configure a valid OPENAI_API_KEY in Settings > Secrets to enable DALL-E 3 image generation',
+      },
+      imageAnalysis: {
+        available: config.toolsEnabled.imageAnalysis && anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Vision + Gemini Multimodal'
+            : openaiLive
+            ? 'OpenAI Vision (gpt-4o / gpt-4.1)'
+            : geminiReady
+            ? 'Google Gemini Multimodal Vision (gemini-3.8-flash)'
+            : 'Unconfigured',
+        note: 'Supports PNG, JPEG, WEBP inspection on selected provider',
+      },
+      pdfAnalysis: {
+        available: config.toolsEnabled.pdfAnalysis && anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Native PDF + Gemini Document Intelligence'
+            : openaiLive
+            ? 'OpenAI Native PDF Input'
+            : geminiReady
+            ? 'Google Gemini Native PDF & Document Analysis'
+            : 'Unconfigured',
+        note: 'Supports native PDF files, TXT, CSV, Markdown & JSON Q&A',
+      },
+      webSearch: {
+        available: config.toolsEnabled.webSearch && anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Web Search + Google Search Grounding'
+            : openaiLive
+            ? 'OpenAI Search (gpt-4o-search-preview)'
+            : geminiReady
+            ? 'Google Search Grounding (gemini-3.8-flash)'
+            : 'Unconfigured',
+        note: 'Live grounded web search with cited source URLs',
+      },
+      speechToText: {
+        available: config.toolsEnabled.voiceChat && anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Audio Transcribe + Gemini 3.5 Transcribe'
+            : openaiLive
+            ? 'OpenAI Audio (gpt-4o-mini-transcribe / whisper-1)'
+            : geminiReady
+            ? 'Google Gemini Audio (gemini-3.5-transcribe)'
+            : 'Unconfigured',
+        note: 'Supports English & Bengali microphone dictation',
+      },
+      textToSpeech: {
+        available: config.toolsEnabled.voiceChat && anyChatReady,
+        provider:
+          openaiLive && geminiReady
+            ? 'OpenAI Neural TTS + Gemini 3.8 Flash Lite TTS'
+            : openaiLive
+            ? 'OpenAI Audio Speech (tts-1)'
+            : geminiReady
+            ? 'Google Gemini Neural TTS (gemini-3.8-flash-lite-tts)'
+            : 'Unconfigured',
+        note: 'Server-side neural speech synthesis',
+      },
+      realtimeVoice: {
+        available:
+          config.toolsEnabled.voiceChat && (openaiRealtimeReady || geminiReady),
+        provider:
+          openaiRealtimeReady && geminiReady
+            ? 'OpenAI Realtime API + Gemini 3.8 Live API'
+            : openaiRealtimeReady
+            ? 'OpenAI Realtime WebSocket'
+            : geminiReady
+            ? 'Google Gemini Live API (gemini-3.8-live)'
+            : 'Unconfigured',
+        note: 'Low-latency bi-directional PCM audio streaming over WebSocket',
+      },
+    },
+  };
+
+  return {
+    enrichedConfig: {
+      ...config,
+      models: enrichedModels,
+    },
+    capabilities,
+  };
+}
+
+/**
+ * Synchronous capability snapshot fallback when cached discovery is used.
+ */
+export function getProviderCapabilities(
+  config: PlatformConfigDTO
+): ProviderCapabilitiesDTO {
+  const openaiKeySet = isOpenAIConfigured();
+  const openaiVerified = cachedDiscovery?.data.reachable ?? false;
+  const geminiReady = isGeminiConfigured();
+  const anyReady = openaiVerified || geminiReady;
+
+  return {
+    openaiConfigured: openaiKeySet,
+    openaiLiveVerified: openaiVerified,
+    geminiConfigured: geminiReady,
+    geminiBridgeConfigured: geminiReady,
+    activeMode:
+      openaiVerified && geminiReady
+        ? 'multi-provider-live'
+        : openaiVerified
+        ? 'openai-live'
+        : geminiReady
+        ? 'gemini-live'
+        : 'demo-simulation',
+    openaiDiscovery: cachedDiscovery?.data,
+    features: {
+      chatStreaming: {
+        available: anyReady,
+        provider:
+          openaiVerified && geminiReady
+            ? 'OpenAI + Google Gemini'
+            : openaiVerified
+            ? 'OpenAI Official API'
+            : geminiReady
+            ? 'Google Gemini API'
+            : 'Unconfigured',
+        note: 'Server-side streaming AI chat',
+      },
+      reasoning: {
+        available: anyReady,
+        provider: openaiVerified ? 'OpenAI o-series + Gemini' : 'Gemini Thinking',
+        note: 'Multi-step reasoning',
+      },
+      imageGeneration: {
+        available: config.toolsEnabled.imageGeneration && openaiVerified,
+        provider: openaiVerified
+          ? 'OpenAI (dall-e-3)'
+          : 'Requires Valid OPENAI_API_KEY',
+        note: openaiVerified
+          ? 'Official OpenAI DALL-E 3 enabled'
+          : 'Requires valid OPENAI_API_KEY in Settings > Secrets',
+      },
+      imageAnalysis: {
+        available: config.toolsEnabled.imageAnalysis && anyReady,
+        provider: openaiVerified ? 'OpenAI Vision' : 'Gemini Multimodal',
+        note: 'Image understanding',
+      },
+      pdfAnalysis: {
+        available: config.toolsEnabled.pdfAnalysis && anyReady,
+        provider: openaiVerified ? 'OpenAI PDF' : 'Gemini PDF Intelligence',
+        note: 'PDF & document analysis',
+      },
+      webSearch: {
+        available: config.toolsEnabled.webSearch && anyReady,
+        provider: openaiVerified ? 'OpenAI Search' : 'Google Search Grounding',
+        note: 'Live web citations',
+      },
+      speechToText: {
+        available: config.toolsEnabled.voiceChat && anyReady,
+        provider: openaiVerified ? 'OpenAI Audio' : 'Gemini 3.5 Transcribe',
+        note: 'Speech-to-text',
+      },
+      textToSpeech: {
+        available: config.toolsEnabled.voiceChat && anyReady,
+        provider: openaiVerified ? 'OpenAI TTS' : 'Gemini 3.8 TTS',
+        note: 'Text-to-speech',
+      },
+      realtimeVoice: {
+        available: config.toolsEnabled.voiceChat && anyReady,
+        provider: geminiReady ? 'Gemini 3.8 Live' : 'OpenAI Realtime',
+        note: 'Realtime duplex voice',
+      },
+    },
+  };
+}
+
+export function calculateProviderCostUsd(
   modelId: string,
   promptTokens: number,
   completionTokens: number,
-  providerUsed: 'openai' | 'gemini' | 'demo'
+  providerUsed: 'openai' | 'gemini',
+  customRates?: { inputUsdPer1M?: number; outputUsdPer1M?: number }
 ): number {
-  if (providerUsed !== 'openai') {
-    // Only record real OpenAI USD spend when OpenAI API was genuinely called!
-    return 0;
-  }
-  const pricing =
-    OPENAI_PRICING_USD_PER_1M[modelId] || OPENAI_PRICING_USD_PER_1M['gpt-4o-mini'];
-  const inputCost = (promptTokens / 1_000_000) * pricing.input;
-  const outputCost = (completionTokens / 1_000_000) * pricing.output;
+  const table =
+    providerUsed === 'gemini'
+      ? GEMINI_PRICING_USD_PER_1M
+      : OPENAI_PRICING_USD_PER_1M;
+  const fallback =
+    table[modelId] ||
+    (providerUsed === 'gemini'
+      ? GEMINI_PRICING_USD_PER_1M['gemini-3.8-flash']
+      : OPENAI_PRICING_USD_PER_1M['gpt-4o']);
+
+  const inputRate =
+    typeof customRates?.inputUsdPer1M === 'number' &&
+    customRates.inputUsdPer1M > 0
+      ? customRates.inputUsdPer1M
+      : fallback.input;
+  const outputRate =
+    typeof customRates?.outputUsdPer1M === 'number' &&
+    customRates.outputUsdPer1M > 0
+      ? customRates.outputUsdPer1M
+      : fallback.output;
+
+  const inputCost = (promptTokens / 1_000_000) * inputRate;
+  const outputCost = (completionTokens / 1_000_000) * outputRate;
   return Number((inputCost + outputCost).toFixed(6));
 }
 
@@ -151,6 +720,7 @@ export interface StreamChatOptions {
   history: Array<{ role: 'user' | 'assistant'; content: string }>;
   prompt: string;
   webSearch: boolean;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   attachments?: Array<{
     name: string;
     mimeType: string;
@@ -166,406 +736,1017 @@ export interface StreamChatResult {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
-  providerUsed: 'openai' | 'gemini' | 'demo';
+  providerUsed: 'openai' | 'gemini';
+  modelUsed: string;
   providerCostUsd: number;
 }
 
+function buildSystemInstruction(userFullName: string): string {
+  return `You are QAAGA AGENT, an enterprise-grade AI assistant built with original QAAGA AGENT branding for ${userFullName}.
+- Deliver accurate, structured Markdown answers with syntax-highlighted code blocks, tables, and clear reasoning.
+- Fluently support English, Bengali (বাংলা), and Banglish.
+- Maintain original QAAGA AGENT identity.`;
+}
+
+function resolveOfficialOpenAIModel(requestedId: string): string {
+  const clean = (requestedId || '').trim();
+  const allowed = new Set([
+    'o3',
+    'o3-mini',
+    'o4-mini',
+    'o1',
+    'gpt-4o',
+    'gpt-4o-mini',
+    'gpt-4.1',
+    'gpt-4.1-mini',
+    'gpt-4.1-nano',
+    'gpt-4o-search-preview',
+    'gpt-4o-mini-search-preview',
+  ]);
+  if (allowed.has(clean)) return clean;
+  if (clean.startsWith('o4')) return 'o4-mini';
+  if (clean.startsWith('o3')) return 'o3-mini';
+  if (clean.includes('mini')) return 'gpt-4o-mini';
+  return 'gpt-4o';
+}
+
+function resolveAllowedGeminiModel(requestedId: string): string {
+  const clean = (requestedId || '').trim();
+  const allowed = new Set([
+    'gemini-3.8-flash',
+    'gemini-flash-latest',
+    'gemini-3.1-flash-lite',
+  ]);
+  if (allowed.has(clean)) return clean;
+  if (clean.includes('lite')) return 'gemini-3.1-flash-lite';
+  return 'gemini-3.8-flash';
+}
+
+/**
+ * Streams chat/reasoning/vision/PDF/web-search strictly via the selected model's provider
+ * (`openai` or `gemini`). NEVER silently switches providers on failure!
+ */
 export async function streamChatCompletion(
   opts: StreamChatOptions
 ): Promise<StreamChatResult> {
-  const systemPrompt = `You are QAAGA AGENT, an enterprise-grade AI assistant built with original QAAGA AGENT branding for ${opts.userFullName}.
-- Deliver accurate, structured Markdown answers with syntax-highlighted code blocks, tables, and clear reasoning.
-- Fluently support English, Bengali (বাংলা), and Banglish.
-- Never claim official OpenAI affiliation or ChatGPT branding; you are QAAGA AGENT.`;
+  const selectedProvider =
+    opts.modelConfig.provider === 'gemini' ||
+    opts.modelConfig.provider === 'bridge'
+      ? 'gemini'
+      : 'openai';
 
-  // 1. Primary Path: Official Server-Side OpenAI SDK when OPENAI_API_KEY is configured
-  if (isOpenAIConfigured()) {
-    const openai = getOpenAIClient();
-    const targetModel = opts.webSearch
-      ? 'gpt-4o-search-preview'
-      : opts.modelConfig.id;
+  if (selectedProvider === 'gemini') {
+    return streamGeminiChatCompletion(opts);
+  }
+  return streamOpenAIChatCompletion(opts);
+}
 
-    const userContentParts: Array<
-      | { type: 'text'; text: string }
-      | { type: 'image_url'; image_url: { url: string } }
-    > = [];
+async function streamOpenAIChatCompletion(
+  opts: StreamChatOptions
+): Promise<StreamChatResult> {
+  const openai = getOpenAIClient();
+  const systemPrompt = buildSystemInstruction(opts.userFullName);
 
-    if (opts.attachments && opts.attachments.length > 0) {
-      for (const att of opts.attachments) {
-        if (att.mimeType.startsWith('image/')) {
-          userContentParts.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${att.mimeType};base64,${att.base64Data}`,
-            },
-          });
-        } else {
-          // Decode text/PDF readable content snippet for OpenAI chat message context
-          const decoded = Buffer.from(att.base64Data, 'base64')
-            .toString('utf-8')
-            .replace(/[^\x09\x0A\x0D\x20-\x7E\u0980-\u09FF]/g, ' ')
-            .slice(0, 18000);
-          userContentParts.push({
-            type: 'text',
-            text: `[Attached Document: ${att.name}]\n${decoded}`,
-          });
-        }
+  const hasAttachments = Boolean(opts.attachments && opts.attachments.length > 0);
+  const hasBinaryPdfOrImage = Boolean(
+    opts.attachments?.some(
+      (a) =>
+        a.mimeType.startsWith('image/') || a.mimeType === 'application/pdf'
+    )
+  );
+
+  let targetModel = resolveOfficialOpenAIModel(opts.modelConfig.id);
+
+  if (opts.webSearch) {
+    targetModel = targetModel.includes('mini')
+      ? 'gpt-4o-mini-search-preview'
+      : 'gpt-4o-search-preview';
+  } else if (hasBinaryPdfOrImage && targetModel === 'o3-mini') {
+    // o3-mini is text-only; route PDF/image attachments to gpt-4o within OpenAI
+    targetModel = 'gpt-4o';
+  }
+
+  const isReasoningModel =
+    targetModel === 'o3' ||
+    targetModel.startsWith('o3-') ||
+    targetModel.startsWith('o4-') ||
+    targetModel === 'o1';
+
+  const userContentParts: Array<Record<string, unknown>> = [];
+
+  if (hasAttachments && opts.attachments) {
+    for (const att of opts.attachments) {
+      const mime = (att.mimeType || '').toLowerCase();
+      if (mime.startsWith('image/')) {
+        userContentParts.push({
+          type: 'image_url',
+          image_url: {
+            url: `data:${att.mimeType};base64,${att.base64Data}`,
+            detail: 'auto',
+          },
+        });
+      } else if (
+        mime === 'application/pdf' ||
+        att.name.toLowerCase().endsWith('.pdf')
+      ) {
+        userContentParts.push({
+          type: 'file',
+          file: {
+            filename: att.name || 'document.pdf',
+            file_data: `data:application/pdf;base64,${att.base64Data}`,
+          },
+        });
+      } else {
+        const decodedText = Buffer.from(att.base64Data, 'base64')
+          .toString('utf-8')
+          .slice(0, 48_000);
+        userContentParts.push({
+          type: 'text',
+          text: `[Attached Document: ${att.name}]\n\`\`\`\n${decodedText}\n\`\`\``,
+        });
       }
     }
+  }
 
-    userContentParts.push({
-      type: 'text',
-      text: opts.prompt || 'Analyze the attached content thoroughly.',
-    });
+  userContentParts.push({
+    type: 'text',
+    text:
+      opts.prompt?.trim() ||
+      'Analyze and summarize the attached document or image thoroughly.',
+  });
 
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-      { role: 'system', content: systemPrompt },
-      ...opts.history.slice(-10).map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      { role: 'user', content: userContentParts },
-    ];
+  const messages: unknown[] = [
+    {
+      role: isReasoningModel ? 'developer' : 'system',
+      content: systemPrompt,
+    },
+    ...opts.history.slice(-10).map((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+    {
+      role: 'user',
+      content:
+        userContentParts.length === 1 && userContentParts[0].type === 'text'
+          ? String(userContentParts[0].text)
+          : userContentParts,
+    },
+  ];
 
-    const stream = await openai.chat.completions.create({
-      model: targetModel,
+  const runOpenAIStream = async (modelToCall: string) => {
+    const requestPayload: Record<string, unknown> = {
+      model: modelToCall,
       messages,
       stream: true,
       stream_options: { include_usage: true },
-    });
+    };
+
+    if (
+      modelToCall === 'o3' ||
+      modelToCall.startsWith('o3-') ||
+      modelToCall.startsWith('o4-')
+    ) {
+      requestPayload.reasoning_effort = opts.reasoningEffort || 'medium';
+    }
+
+    if (modelToCall.includes('search-preview')) {
+      requestPayload.web_search_options = {
+        search_context_size: 'medium',
+      };
+    }
+
+    const stream = (await openai.chat.completions.create(
+      requestPayload as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
+    )) as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
 
     let fullText = '';
     let promptTokens = 0;
     let completionTokens = 0;
+    const citationMap = new Map<string, GroundingLink>();
 
     for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content;
-      if (delta) {
-        fullText += delta;
-        opts.onDelta(delta);
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
+
+      if (delta?.content) {
+        fullText += delta.content;
+        opts.onDelta(delta.content);
       }
+
+      const annotations = (
+        delta as unknown as {
+          annotations?: Array<{
+            type?: string;
+            url_citation?: { url?: string; title?: string };
+          }>;
+        }
+      )?.annotations;
+
+      if (Array.isArray(annotations)) {
+        for (const ann of annotations) {
+          const url = ann.url_citation?.url;
+          if (url) {
+            let fallbackTitle = url;
+            try {
+              fallbackTitle = new URL(url).hostname;
+            } catch {
+              // keep raw URL
+            }
+            citationMap.set(url, {
+              uri: url,
+              title: ann.url_citation?.title || fallbackTitle,
+            });
+          }
+        }
+      }
+
       if (chunk.usage) {
         promptTokens = chunk.usage.prompt_tokens || 0;
         completionTokens = chunk.usage.completion_tokens || 0;
       }
     }
 
-    if (promptTokens === 0) {
-      promptTokens = Math.ceil((opts.prompt.length + 250) / 4);
-      completionTokens = Math.ceil(fullText.length / 4);
-    }
-    const totalTokens = promptTokens + completionTokens;
-    const providerCostUsd = calculateOpenAICostUsd(
-      targetModel,
+    return {
+      fullText,
+      citations: Array.from(citationMap.values()),
       promptTokens,
       completionTokens,
-      'openai'
+      modelUsed: modelToCall,
+    };
+  };
+
+  try {
+    let outcome: Awaited<ReturnType<typeof runOpenAIStream>>;
+    try {
+      outcome = await withOverloadRetry(
+        () => runOpenAIStream(targetModel),
+        (e) => formatOpenAIError(e, 'OpenAI Chat Stream')
+      );
+    } catch (primaryErr: unknown) {
+      const status = (primaryErr as { status?: number })?.status;
+      if (
+        opts.webSearch &&
+        targetModel === 'gpt-4o-search-preview' &&
+        (status === 404 || status === 403)
+      ) {
+        outcome = await runOpenAIStream('gpt-4o-mini-search-preview');
+      } else {
+        throw primaryErr;
+      }
+    }
+
+    const promptTokens =
+      outcome.promptTokens > 0
+        ? outcome.promptTokens
+        : Math.ceil((opts.prompt.length + 250) / 4);
+    const completionTokens =
+      outcome.completionTokens > 0
+        ? outcome.completionTokens
+        : Math.ceil(outcome.fullText.length / 4);
+    const totalTokens = promptTokens + completionTokens;
+
+    const providerCostUsd = calculateProviderCostUsd(
+      outcome.modelUsed,
+      promptTokens,
+      completionTokens,
+      'openai',
+      {
+        inputUsdPer1M: opts.modelConfig.inputUsdPer1M,
+        outputUsdPer1M: opts.modelConfig.outputUsdPer1M,
+      }
     );
 
     return {
-      fullText,
-      citations: [],
+      fullText: outcome.fullText,
+      citations: outcome.citations,
       promptTokens,
       completionTokens,
       totalTokens,
       providerUsed: 'openai',
+      modelUsed: outcome.modelUsed,
       providerCostUsd,
     };
+  } catch (err: unknown) {
+    throw err instanceof Error
+      ? new Error(redactSecrets(err.message))
+      : formatOpenAIError(err, 'OpenAI Chat Stream');
   }
+}
 
-  // 2. Secondary Path: Server-Side Multimodal Bridge when OPENAI_API_KEY is not configured
-  if (isGeminiBridgeConfigured()) {
-    const ai = getGeminiClient();
-    const priorContents = opts.history.slice(-10).map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }],
-    }));
+async function streamGeminiChatCompletion(
+  opts: StreamChatOptions
+): Promise<StreamChatResult> {
+  const ai = getGeminiClient();
+  const targetModel = resolveAllowedGeminiModel(opts.modelConfig.id);
+  const systemInstruction = buildSystemInstruction(opts.userFullName);
 
-    const parts: Array<
-      { text: string } | { inlineData: { mimeType: string; data: string } }
-    > = [];
+  const contents: Array<{
+    role: 'user' | 'model';
+    parts: Array<Record<string, unknown>>;
+  }> = opts.history.slice(-10).map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
 
-    if (opts.attachments && opts.attachments.length > 0) {
-      for (const att of opts.attachments) {
-        parts.push({
+  const currentParts: Array<Record<string, unknown>> = [];
+  if (opts.attachments && opts.attachments.length > 0) {
+    for (const att of opts.attachments) {
+      const mime = (att.mimeType || '').toLowerCase();
+      if (
+        mime.startsWith('image/') ||
+        mime === 'application/pdf' ||
+        att.name.toLowerCase().endsWith('.pdf')
+      ) {
+        currentParts.push({
           inlineData: {
-            mimeType: att.mimeType || 'application/pdf',
+            mimeType: mime || 'application/pdf',
             data: att.base64Data,
           },
         });
+      } else {
+        const decodedText = Buffer.from(att.base64Data, 'base64')
+          .toString('utf-8')
+          .slice(0, 48_000);
+        currentParts.push({
+          text: `[Attached Document: ${att.name}]\n\`\`\`\n${decodedText}\n\`\`\``,
+        });
       }
     }
-    parts.push({
-      text: opts.prompt || 'Summarize and analyze the uploaded file.',
-    });
+  }
 
-    const isReasoning = opts.modelConfig.category === 'reasoning';
+  currentParts.push({
+    text:
+      opts.prompt?.trim() ||
+      'Analyze and summarize the attached document or image thoroughly.',
+  });
+
+  contents.push({
+    role: 'user',
+    parts: currentParts,
+  });
+
+  const runGeminiStream = async () => {
+    const configObj: Record<string, unknown> = {
+      systemInstruction,
+    };
+
+    if (opts.webSearch) {
+      configObj.tools = [{ googleSearch: {} }];
+    }
+
+    if (targetModel === 'gemini-3.8-flash' && opts.reasoningEffort === 'high') {
+      configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
+    } else if (targetModel === 'gemini-3.8-flash') {
+      configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+    }
+
     const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-3.8-flash',
-      contents: [...priorContents, { role: 'user', parts }],
-      config: {
-        systemInstruction: systemPrompt,
-        thinkingConfig: {
-          thinkingLevel: isReasoning ? ThinkingLevel.HIGH : ThinkingLevel.LOW,
-        },
-        ...(opts.webSearch
-          ? { tools: [{ googleSearch: {} }, { urlContext: {} }] }
-          : {}),
-      },
+      model: targetModel,
+      contents,
+      config: configObj,
     });
 
     let fullText = '';
+    let promptTokens = 0;
+    let completionTokens = 0;
     const citationMap = new Map<string, GroundingLink>();
 
-    for await (const chunk of responseStream) {
-      const c = chunk as GenerateContentResponse;
-      if (c.text) {
-        fullText += c.text;
-        opts.onDelta(c.text);
+    for await (const rawChunk of responseStream) {
+      const chunk = rawChunk as GenerateContentResponse;
+      const deltaText = chunk.text;
+      if (deltaText) {
+        fullText += deltaText;
+        opts.onDelta(deltaText);
       }
-      const gChunks = c.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (Array.isArray(gChunks)) {
-        for (const gc of gChunks) {
-          const web = (gc as { web?: { uri?: string; title?: string } }).web;
+
+      const groundingChunks =
+        chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+      if (Array.isArray(groundingChunks)) {
+        for (const g of groundingChunks) {
+          const web = (g as { web?: { uri?: string; title?: string } })?.web;
           if (web?.uri) {
             citationMap.set(web.uri, {
               uri: web.uri,
-              title: web.title || new URL(web.uri).hostname,
+              title: web.title || web.uri,
             });
           }
         }
       }
-    }
 
-    const promptTokens = Math.ceil((opts.prompt.length + 280) / 4);
-    const completionTokens = Math.ceil(fullText.length / 4);
+      if (chunk.usageMetadata) {
+        promptTokens = chunk.usageMetadata.promptTokenCount || promptTokens;
+        completionTokens =
+          chunk.usageMetadata.candidatesTokenCount || completionTokens;
+      }
+    }
 
     return {
       fullText,
       citations: Array.from(citationMap.values()),
       promptTokens,
       completionTokens,
-      totalTokens: promptTokens + completionTokens,
-      providerUsed: 'gemini',
-      providerCostUsd: 0,
     };
-  }
-
-  // 3. Explicit Labeled Demo Mode if neither API key is configured
-  const demoReply = `**[QAAGA AGENT — Labeled Demo Mode]**\n\nNo \`OPENAI_API_KEY\` is currently configured on the server. Once your administrator sets \`OPENAI_API_KEY\` in environment variables, requests for **${opts.modelConfig.label}** will stream live from OpenAI.\n\n**Echoed Request:** ${opts.prompt}`;
-  opts.onDelta(demoReply);
-  return {
-    fullText: demoReply,
-    citations: [],
-    promptTokens: 40,
-    completionTokens: 60,
-    totalTokens: 100,
-    providerUsed: 'demo',
-    providerCostUsd: 0,
   };
+
+  try {
+    const outcome = await withOverloadRetry(
+      runGeminiStream,
+      (e) => formatGeminiError(e, 'Google Gemini Chat Stream')
+    );
+
+    const promptTokens =
+      outcome.promptTokens > 0
+        ? outcome.promptTokens
+        : Math.ceil((opts.prompt.length + 200) / 4);
+    const completionTokens =
+      outcome.completionTokens > 0
+        ? outcome.completionTokens
+        : Math.ceil(outcome.fullText.length / 4);
+    const totalTokens = promptTokens + completionTokens;
+
+    const providerCostUsd = calculateProviderCostUsd(
+      targetModel,
+      promptTokens,
+      completionTokens,
+      'gemini',
+      {
+        inputUsdPer1M: opts.modelConfig.inputUsdPer1M,
+        outputUsdPer1M: opts.modelConfig.outputUsdPer1M,
+      }
+    );
+
+    return {
+      fullText: outcome.fullText,
+      citations: outcome.citations,
+      promptTokens,
+      completionTokens,
+      totalTokens,
+      providerUsed: 'gemini',
+      modelUsed: targetModel,
+      providerCostUsd,
+    };
+  } catch (err: unknown) {
+    throw err instanceof Error
+      ? new Error(redactSecrets(err.message))
+      : formatGeminiError(err, 'Google Gemini Chat Stream');
+  }
 }
 
+/**
+ * Official OpenAI Image Generation (`dall-e-3` / `gpt-image-1`).
+ * Never silently switches providers on failure.
+ */
 export async function generateImageAsset(
   prompt: string,
   aspectRatio: '1:1' | '16:9' | '3:4'
 ): Promise<{
   imageDataUrl: string;
   revisedPrompt: string;
-  providerUsed: 'openai' | 'gemini' | 'demo';
+  providerUsed: 'openai';
+  modelUsed: string;
   providerCostUsd: number;
 }> {
-  if (isOpenAIConfigured()) {
-    const openai = getOpenAIClient();
-    const size =
-      aspectRatio === '16:9'
-        ? '1792x1024'
-        : aspectRatio === '3:4'
-        ? '1024x1792'
-        : '1024x1024';
-    const response = await openai.images.generate({
-      model: 'dall-e-3',
-      prompt,
-      n: 1,
-      size,
-      response_format: 'b64_json',
-    });
-    const b64 = response.data?.[0]?.b64_json;
-    if (!b64) throw new Error('OpenAI image response did not contain image bytes.');
-    return {
-      imageDataUrl: `data:image/png;base64,${b64}`,
-      revisedPrompt: response.data?.[0]?.revised_prompt || prompt,
-      providerUsed: 'openai',
-      providerCostUsd: size === '1024x1024' ? 0.04 : 0.08,
-    };
+  const openai = getOpenAIClient();
+  const size =
+    aspectRatio === '16:9'
+      ? '1792x1024'
+      : aspectRatio === '3:4'
+      ? '1024x1792'
+      : '1024x1024';
+
+  const response = await withOverloadRetry(
+    () =>
+      openai.images.generate({
+        model: 'dall-e-3',
+        prompt,
+        n: 1,
+        size,
+        response_format: 'b64_json',
+      }),
+    (e) => formatOpenAIError(e, 'OpenAI Image Generation')
+  );
+
+  const b64 = response.data?.[0]?.b64_json;
+  if (!b64) {
+    throw new Error('OpenAI Images API did not return image data.');
   }
 
-  if (isGeminiBridgeConfigured()) {
-    const ai = getGeminiClient();
-    const dims =
-      aspectRatio === '16:9'
-        ? { w: 1280, h: 720 }
-        : aspectRatio === '3:4'
-        ? { w: 768, h: 1024 }
-        : { w: 1024, h: 1024 };
-
-    const res = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: `Generate a rich, multi-layered, high-detail SVG illustration for: "${prompt}".
-Root element MUST be <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dims.w} ${dims.h}" width="${dims.w}" height="${dims.h}"> with gradients, lighting, atmospheric depth, and at least 25 vector shapes. No external URLs or scripts.`,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            revisedPrompt: { type: Type.STRING },
-            svgMarkup: { type: Type.STRING },
-          },
-          required: ['revisedPrompt', 'svgMarkup'],
-        },
-      },
-    });
-
-    const parsed = JSON.parse((res.text || '{}').trim()) as {
-      revisedPrompt?: string;
-      svgMarkup?: string;
-    };
-    const svg =
-      parsed.svgMarkup && parsed.svgMarkup.includes('<svg')
-        ? parsed.svgMarkup
-        : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800"><rect width="800" height="800" fill="#064E3B"/><circle cx="400" cy="400" r="220" fill="#10B981"/></svg>`;
-    const b64Svg = Buffer.from(svg, 'utf-8').toString('base64');
-    return {
-      imageDataUrl: `data:image/svg+xml;base64,${b64Svg}`,
-      revisedPrompt: parsed.revisedPrompt || prompt,
-      providerUsed: 'gemini',
-      providerCostUsd: 0,
-    };
-  }
-
-  const demoSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><rect width="1024" height="1024" fill="#0F172A"/><circle cx="512" cy="460" r="210" fill="#059669" opacity="0.85"/><text x="512" y="820" fill="#F8FAFC" font-family="sans-serif" font-size="32" text-anchor="middle">QAAGA Demo Canvas (Configure OPENAI_API_KEY)</text></svg>`;
   return {
-    imageDataUrl: `data:image/svg+xml;base64,${Buffer.from(demoSvg).toString('base64')}`,
-    revisedPrompt: `[Demo Mode] ${prompt}`,
-    providerUsed: 'demo',
-    providerCostUsd: 0,
+    imageDataUrl: `data:image/png;base64,${b64}`,
+    revisedPrompt: response.data?.[0]?.revised_prompt || prompt,
+    providerUsed: 'openai',
+    modelUsed: 'dall-e-3',
+    providerCostUsd: size === '1024x1024' ? 0.04 : 0.08,
   };
 }
 
+/**
+ * Speech-to-Text supporting Official OpenAI (`gpt-4o-mini-transcribe` / `whisper-1`)
+ * and Google Gemini (`gemini-3.5-transcribe`), routing strictly by chosen provider.
+ */
 export async function transcribeAudioBuffer(
   base64Audio: string,
-  mimeType: string
+  mimeType: string,
+  preferredProvider?: 'openai' | 'gemini'
 ): Promise<{
   transcript: string;
-  providerUsed: 'openai' | 'gemini' | 'demo';
+  providerUsed: 'openai' | 'gemini';
+  modelUsed: string;
   providerCostUsd: number;
 }> {
-  if (isOpenAIConfigured()) {
-    const openai = getOpenAIClient();
-    const buffer = Buffer.from(base64Audio, 'base64');
-    const ext = mimeType.includes('wav') ? 'wav' : 'webm';
-    const file = await OpenAI.toFile(buffer, `speech.${ext}`, { type: mimeType });
+  const targetProvider: 'openai' | 'gemini' =
+    preferredProvider ||
+    (cachedDiscovery?.data.reachable
+      ? 'openai'
+      : isGeminiConfigured()
+      ? 'gemini'
+      : 'openai');
+
+  if (targetProvider === 'gemini') {
+    const ai = getGeminiClient();
+    const response = await withOverloadRetry(
+      () =>
+        ai.models.generateContent({
+          model: 'gemini-3.5-transcribe',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: mimeType || 'audio/webm',
+                  data: base64Audio,
+                },
+              },
+              {
+                text: 'Transcribe this spoken audio accurately. Output only the spoken transcript.',
+              },
+            ],
+          },
+        }),
+      (e) => formatGeminiError(e, 'Gemini Speech-to-Text')
+    );
+
+    const promptTokens = response.usageMetadata?.promptTokenCount || 120;
+    const completionTokens = response.usageMetadata?.candidatesTokenCount || 40;
+    const providerCostUsd = calculateProviderCostUsd(
+      'gemini-3.5-transcribe',
+      promptTokens,
+      completionTokens,
+      'gemini'
+    );
+
+    return {
+      transcript: (response.text || '').trim(),
+      providerUsed: 'gemini',
+      modelUsed: 'gemini-3.5-transcribe',
+      providerCostUsd,
+    };
+  }
+
+  // OpenAI Audio Transcriptions
+  const openai = getOpenAIClient();
+  const buffer = Buffer.from(base64Audio, 'base64');
+  const lowerMime = (mimeType || 'audio/webm').toLowerCase();
+  const ext = lowerMime.includes('wav')
+    ? 'wav'
+    : lowerMime.includes('mp3') || lowerMime.includes('mpeg')
+    ? 'mp3'
+    : lowerMime.includes('mp4') || lowerMime.includes('m4a')
+    ? 'm4a'
+    : lowerMime.includes('ogg')
+    ? 'ogg'
+    : 'webm';
+
+  const runOpenAIStt = async (
+    sttModel: 'gpt-4o-mini-transcribe' | 'whisper-1'
+  ) => {
+    const file = await OpenAI.toFile(buffer, `speech.${ext}`, {
+      type: mimeType || `audio/${ext}`,
+    });
     const result = await openai.audio.transcriptions.create({
-      model: 'whisper-1',
+      model: sttModel,
       file,
     });
-    return {
-      transcript: result.text.trim(),
-      providerUsed: 'openai',
-      providerCostUsd: 0.006,
-    };
+    return { text: result.text.trim(), modelUsed: sttModel };
+  };
+
+  let out: { text: string; modelUsed: string };
+  try {
+    out = await withOverloadRetry(
+      () => runOpenAIStt('gpt-4o-mini-transcribe'),
+      (e) => formatOpenAIError(e, 'OpenAI Speech-to-Text')
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '';
+    if (/404|model_not_found|not unlocked/i.test(msg)) {
+      out = await withOverloadRetry(
+        () => runOpenAIStt('whisper-1'),
+        (e) => formatOpenAIError(e, 'OpenAI Whisper STT')
+      );
+    } else {
+      throw err;
+    }
   }
 
-  if (isGeminiBridgeConfigured()) {
-    const ai = getGeminiClient();
-    const res = await ai.models.generateContent({
-      model: 'gemini-3.5-transcribe',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: mimeType || 'audio/webm', data: base64Audio } },
-          { text: 'Transcribe this spoken audio accurately in English or Bengali.' },
-        ],
-      },
-    });
-    return {
-      transcript: (res.text || '').trim(),
-      providerUsed: 'gemini',
-      providerCostUsd: 0,
-    };
-  }
+  const estimatedMinutes = Math.max(0.1, buffer.byteLength / (960 * 1024));
+  const ratePerMin =
+    out.modelUsed === 'gpt-4o-mini-transcribe' ? 0.003 : 0.006;
 
   return {
-    transcript: 'Demo voice transcript (configure OPENAI_API_KEY for Whisper STT).',
-    providerUsed: 'demo',
-    providerCostUsd: 0,
+    transcript: out.text,
+    providerUsed: 'openai',
+    modelUsed: out.modelUsed,
+    providerCostUsd: Number((estimatedMinutes * ratePerMin).toFixed(6)),
   };
 }
 
+/**
+ * Text-to-Speech supporting Official OpenAI (`tts-1`) and Google Gemini (`gemini-3.8-flash-lite-tts`),
+ * routing strictly by chosen provider without silent cross-provider fallback.
+ */
 export async function synthesizeSpeechAudio(
   text: string,
-  voice: string
+  voice: string,
+  preferredProvider?: 'openai' | 'gemini'
 ): Promise<{
   audioDataUrl: string;
-  providerUsed: 'openai' | 'gemini' | 'demo';
+  providerUsed: 'openai' | 'gemini';
+  modelUsed: string;
   providerCostUsd: number;
 }> {
   const cleanText = text
     .replace(/```[\s\S]*?```/g, 'Code block omitted.')
     .replace(/[#*_`>|]/g, '')
-    .slice(0, 1200);
+    .trim()
+    .slice(0, 1800);
 
-  if (isOpenAIConfigured()) {
-    const openai = getOpenAIClient();
-    const validVoice = (
-      ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].includes(voice)
-        ? voice
-        : 'alloy'
-    ) as 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer';
+  const targetProvider: 'openai' | 'gemini' =
+    preferredProvider ||
+    (cachedDiscovery?.data.reachable
+      ? 'openai'
+      : isGeminiConfigured()
+      ? 'gemini'
+      : 'openai');
 
-    const mp3 = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice: validVoice,
-      input: cleanText,
-    });
-    const buffer = Buffer.from(await mp3.arrayBuffer());
-    const cost = Number(((cleanText.length / 1000) * 0.015).toFixed(6));
-    return {
-      audioDataUrl: `data:audio/mpeg;base64,${buffer.toString('base64')}`,
-      providerUsed: 'openai',
-      providerCostUsd: cost,
-    };
-  }
-
-  if (isGeminiBridgeConfigured()) {
+  if (targetProvider === 'gemini') {
     const ai = getGeminiClient();
-    const voiceMap: Record<string, string> = {
-      alloy: 'Kore',
-      nova: 'Zephyr',
+    const geminiVoiceMap: Record<string, string> = {
+      alloy: 'Zephyr',
+      nova: 'Kore',
       echo: 'Puck',
       onyx: 'Fenrir',
       shimmer: 'Charon',
+      Zephyr: 'Zephyr',
+      Kore: 'Kore',
+      Puck: 'Puck',
+      Fenrir: 'Fenrir',
+      Charon: 'Charon',
     };
-    const geminiVoice = voiceMap[voice] || 'Kore';
-    const res = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [{ role: 'user', parts: [{ text: cleanText }] }],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: geminiVoice } },
-        },
-      },
-    });
-    const b64 = res.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!b64) throw new Error('Speech synthesis returned empty audio.');
+    const chosenVoice = geminiVoiceMap[voice] || 'Kore';
+
+    const response = await withOverloadRetry(
+      () =>
+        ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: cleanText || 'Hello from QAAGA AGENT.' }],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: chosenVoice },
+              },
+            },
+          },
+        }),
+      (e) => formatGeminiError(e, 'Gemini Text-to-Speech')
+    );
+
+    const base64Audio =
+      response.candidates?.[0]?.content?.parts?.find((p) => p.inlineData?.data)
+        ?.inlineData?.data;
+
+    if (!base64Audio) {
+      throw new Error('Gemini TTS did not return audio data.');
+    }
+
+    const promptTokens = response.usageMetadata?.promptTokenCount || 80;
+    const completionTokens =
+      response.usageMetadata?.candidatesTokenCount || 240;
+
     return {
-      audioDataUrl: `data:audio/wav;base64,${b64}`,
+      // Unary Gemini 3.8 TTS returns a complete RIFF WAV file (24kHz mono 16-bit)
+      audioDataUrl: `data:audio/wav;base64,${base64Audio}`,
       providerUsed: 'gemini',
-      providerCostUsd: 0,
+      modelUsed: 'gemini-3.8-flash-lite-tts',
+      providerCostUsd: calculateProviderCostUsd(
+        'gemini-3.8-flash-lite-tts',
+        promptTokens,
+        completionTokens,
+        'gemini'
+      ),
     };
   }
 
-  throw new Error(
-    'Text-to-speech is unconfigured. Add OPENAI_API_KEY in environment settings.'
+  // OpenAI TTS
+  const openai = getOpenAIClient();
+  const validVoice = (
+    [
+      'alloy',
+      'echo',
+      'fable',
+      'onyx',
+      'nova',
+      'shimmer',
+      'ash',
+      'coral',
+      'sage',
+    ].includes(voice)
+      ? voice
+      : 'alloy'
+  ) as 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer';
+
+  const mp3Response = await withOverloadRetry(
+    () =>
+      openai.audio.speech.create({
+        model: 'tts-1',
+        voice: validVoice,
+        input: cleanText || 'Hello from QAAGA AGENT.',
+      }),
+    (e) => formatOpenAIError(e, 'OpenAI Text-to-Speech')
   );
+
+  const buffer = Buffer.from(await mp3Response.arrayBuffer());
+  const providerCostUsd = Number(((cleanText.length / 1000) * 0.015).toFixed(6));
+
+  return {
+    audioDataUrl: `data:audio/mpeg;base64,${buffer.toString('base64')}`,
+    providerUsed: 'openai',
+    modelUsed: 'tts-1',
+    providerCostUsd,
+  };
+}
+
+/**
+ * Server-side Google Gemini Live API session connector for WebSocket Realtime Voice (`/api/realtime/voice`).
+ */
+export async function connectGeminiLiveVoiceSession(params: {
+  userFullName: string;
+  voiceName?: string;
+  onAudioBase64: (pcm24kBase64: string) => void;
+  onTranscript: (role: 'user' | 'assistant', text: string) => void;
+  onInterrupted: () => void;
+  onError: (safeError: string) => void;
+}) {
+  const ai = getGeminiClient();
+  const voiceMap: Record<string, string> = {
+    alloy: 'Zephyr',
+    nova: 'Kore',
+    echo: 'Puck',
+    onyx: 'Fenrir',
+    shimmer: 'Charon',
+  };
+  const resolvedVoice =
+    voiceMap[params.voiceName || ''] || params.voiceName || 'Zephyr';
+
+  const session = await ai.live.connect({
+    model: 'gemini-3.8-live',
+    config: {
+      responseModalities: [Modality.AUDIO],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName: resolvedVoice },
+        },
+      },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      systemInstruction: `You are QAAGA AGENT Realtime Voice Assistant speaking with ${params.userFullName}. Keep spoken answers natural, helpful, and concise. Support English and Bengali.`,
+    },
+    callbacks: {
+      onmessage: (message: LiveServerMessage) => {
+        const parts = message.serverContent?.modelTurn?.parts;
+        if (Array.isArray(parts)) {
+          for (const part of parts) {
+            if (part.inlineData?.data) {
+              params.onAudioBase64(part.inlineData.data);
+            }
+          }
+        }
+        const inTr = (
+          message.serverContent as unknown as {
+            inputTranscription?: { text?: string };
+          }
+        )?.inputTranscription?.text;
+        if (inTr) {
+          params.onTranscript('user', inTr);
+        }
+        const outTr = (
+          message.serverContent as unknown as {
+            outputTranscription?: { text?: string };
+          }
+        )?.outputTranscription?.text;
+        if (outTr) {
+          params.onTranscript('assistant', outTr);
+        }
+        if (message.serverContent?.interrupted) {
+          params.onInterrupted();
+        }
+      },
+      onerror: (err: unknown) => {
+        const { safeMessage } = extractProviderErrorMeta(err);
+        params.onError(safeMessage);
+      },
+    },
+  });
+
+  return session;
+}
+
+/**
+ * Live Server-Side OpenAI Connection & Account Model Discovery Diagnostic.
+ */
+export async function testOpenAIConnection(): Promise<{
+  ok: boolean;
+  keyPresent: boolean;
+  keyLength: number;
+  status: number | null;
+  errorCode: string | null;
+  message: string;
+  latencyMs: number;
+  availableTargetModels: string[];
+  categorizedModels: OpenAIAccountDiscoveryDTO['categorizedModels'];
+  apiNote: string;
+}> {
+  const startedAt = Date.now();
+  const rawKey = getServerOpenAIKey();
+  const keyPresent = Boolean(rawKey && !PLACEHOLDER_KEYS.has(rawKey));
+  const apiNote =
+    'OpenAI API models are unlocked based on your platform.openai.com API billing tier (independent of ChatGPT Plus/Pro web subscriptions).';
+
+  const { discovery } = await discoverOpenAIAccountModels(true);
+
+  if (!discovery.reachable) {
+    return {
+      ok: false,
+      keyPresent,
+      keyLength: keyPresent ? rawKey.length : 0,
+      status: discovery.status,
+      errorCode: discovery.errorCode,
+      message: discovery.message,
+      latencyMs: Date.now() - startedAt,
+      availableTargetModels: [],
+      categorizedModels: discovery.categorizedModels,
+      apiNote,
+    };
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey: rawKey });
+    const pingModel =
+      discovery.categorizedModels.economical[0] ||
+      discovery.categorizedModels.standard[0] ||
+      'gpt-4o-mini';
+
+    const ping = await openai.chat.completions.create({
+      model: pingModel,
+      messages: [{ role: 'user', content: 'Reply with OK' }],
+      max_tokens: 4,
+    });
+    const reply = ping.choices?.[0]?.message?.content?.trim() || 'OK';
+
+    const allTarget = [
+      ...discovery.categorizedModels.reasoning,
+      ...discovery.categorizedModels.standard,
+      ...discovery.categorizedModels.economical,
+      ...discovery.categorizedModels.image,
+      ...discovery.categorizedModels.audio,
+      ...discovery.categorizedModels.realtime,
+      ...discovery.categorizedModels.search,
+    ];
+
+    return {
+      ok: true,
+      keyPresent: true,
+      keyLength: rawKey.length,
+      status: 200,
+      errorCode: null,
+      message: `Connected to official OpenAI API (${discovery.totalModelsCount} total models accessible; ping "${reply}" via ${pingModel}).`,
+      latencyMs: Date.now() - startedAt,
+      availableTargetModels: allTarget,
+      categorizedModels: discovery.categorizedModels,
+      apiNote,
+    };
+  } catch (err: unknown) {
+    const { status, errorCode } = extractProviderErrorMeta(err);
+    const formatted = formatOpenAIError(err, 'OpenAI Live Completion Ping');
+    return {
+      ok: false,
+      keyPresent: true,
+      keyLength: rawKey.length,
+      status,
+      errorCode,
+      message: formatted.message,
+      latencyMs: Date.now() - startedAt,
+      availableTargetModels: [],
+      categorizedModels: discovery.categorizedModels,
+      apiNote,
+    };
+  }
+}
+
+/**
+ * Live Server-Side Google Gemini Connection Diagnostic.
+ */
+export async function testGeminiConnection(): Promise<
+  ProviderDiagnosticsDTO['gemini']
+> {
+  const startedAt = Date.now();
+  const ready = isGeminiConfigured();
+  if (!ready) {
+    return {
+      ok: false,
+      keyPresent: false,
+      status: null,
+      errorCode: 'missing_gemini_key',
+      message:
+        'GEMINI_API_KEY is not configured in server environment variables.',
+      latencyMs: Date.now() - startedAt,
+      availableModels: [],
+    };
+  }
+
+  try {
+    const ai = getGeminiClient();
+    let usedPingModel = 'gemini-3.1-flash-lite';
+    let res;
+    try {
+      res = await ai.models.generateContent({
+        model: usedPingModel,
+        contents: 'Reply with the single word OK.',
+      });
+    } catch (firstErr: unknown) {
+      const meta = extractProviderErrorMeta(firstErr);
+      if (meta.status === 503 || meta.status === 429) {
+        usedPingModel = 'gemini-3.8-flash';
+        res = await ai.models.generateContent({
+          model: usedPingModel,
+          contents: 'Reply with the single word OK.',
+        });
+      } else {
+        throw firstErr;
+      }
+    }
+    const reply = (res.text || 'OK').trim().slice(0, 24);
+    return {
+      ok: true,
+      keyPresent: true,
+      status: 200,
+      errorCode: null,
+      message: `Connected to Google Gemini API (ping "${reply}" via ${usedPingModel}).`,
+      latencyMs: Date.now() - startedAt,
+      availableModels: [
+        'gemini-3.8-flash',
+        'gemini-3.1-flash-lite',
+        'gemini-3.5-transcribe',
+        'gemini-3.8-flash-lite-tts',
+        'gemini-3.8-live',
+      ],
+    };
+  } catch (err: unknown) {
+    const { status, errorCode } = extractProviderErrorMeta(err);
+    const formatted = formatGeminiError(err, 'Gemini Connection Test');
+    return {
+      ok: false,
+      keyPresent: true,
+      status,
+      errorCode,
+      message: formatted.message,
+      latencyMs: Date.now() - startedAt,
+      availableModels: [],
+    };
+  }
+}
+
+export async function testAllProvidersConnection(): Promise<ProviderDiagnosticsDTO> {
+  const [openaiDiag, geminiDiag] = await Promise.all([
+    testOpenAIConnection(),
+    testGeminiConnection(),
+  ]);
+  return {
+    openai: {
+      ok: openaiDiag.ok,
+      keyPresent: openaiDiag.keyPresent,
+      status: openaiDiag.status,
+      errorCode: openaiDiag.errorCode,
+      message: openaiDiag.message,
+      latencyMs: openaiDiag.latencyMs,
+      availableTargetModels: openaiDiag.availableTargetModels,
+      categorizedModels: openaiDiag.categorizedModels,
+      apiNote: openaiDiag.apiNote,
+    },
+    gemini: geminiDiag,
+  };
 }

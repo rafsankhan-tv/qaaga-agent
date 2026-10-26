@@ -45,23 +45,26 @@ Copy `.env.example` to `.env` (or configure secrets in your Cloud Run / hosting 
 
 ## 3. Pre-Seeded Reference Accounts (For Immediate Verification)
 
-On first launch, QAAGA AGENT idempotently seeds four reference accounts so you can test every RBAC and subscription state immediately:
+On first launch, QAAGA AGENT idempotently seeds reference accounts so you can test the Guest Front Page, Admin Panel, Unpaid User Recharge Gate, and Active Subscriber workflows immediately:
 
-- **Platform Administrator (`ACTIVE`)**: `admin@qaaga.ai` / `Admin@12345` (or sign in with Google using `ADMIN_BOOTSTRAP_EMAIL`)
-- **Active Subscriber (`ACTIVE` · 30-Day Plan)**: `tanvir@qaaga.ai` / `User@12345`
-- **Pending Approval User (`PENDING`)**: `nusrat.jahan@example.com` / `Pending@12345`
-- **Expired Subscription User (`EXPIRED` · Carry-Forward Balance)**: `arif.hossain@example.com` / `Expired@12345`
+- **Quick Admin Panel (`ACTIVE`)**: `admin` / `admin` (also `admin@qaaga.ai` / `Admin@12345`) — opens the dedicated **QAAGA AGENT Admin Console** directly.
+- **Unpaid / New User (`PENDING` · 0 Credits)**: `user` / `user` — enters the workspace and prompts **Recharge Required** (`20 / 50 / 100 / 200 BDT`) when running commands.
+- **Active Subscriber (`ACTIVE` · 30-Day Plan · 80 Credits)**: `tanvir@qaaga.ai` / `User@12345` — full access to Chat, Image Studio, PDF Analysis, Web Search, and Voice Studio.
+- **Additional Test States**: `rafiq@qaaga.ai` / `Pending@12345` (`PENDING`) and `arif.hossain@example.com` / `Expired@12345` (`EXPIRED` carry-forward balance).
 
 ---
 
-## 4. Feature & Credential Readiness Checklist
+## 4. Progressive Access & Feature Readiness Checklist
 
 | Capability | Status | Details |
 | :--- | :--- | :--- |
+| **Public Front Page & Guest Chat** | **Fully Functional** | `/` opens the **QAAGA AGENT** Front Page immediately with free streaming text chat (`POST /api/public/chat/stream`). |
+| **Progressive Login & Recharge Gates** | **Fully Functional** | Non-chat commands (`Image`, `PDF`, `Web Search`, `Voice`, `Upload`) prompt **Sign In / Register** for guests, and **Recharge Required** (`402`) after login when credits or 30-day plan are inactive. |
 | **PostgreSQL Schema & Drizzle ORM** | **Fully Functional** | 10 relational tables (`users`, `credit_ledger`, `provider_usage_logs`, `recharge_packages`, `payment_requests`, `chat_sessions`, `chat_messages`, `notifications`, `platform_settings`, `audit_logs`). |
 | **Email/Password + Google Auth** | **Fully Functional** | Salted `scrypt` password hashing + HMAC-SHA256 JWTs + Firebase Google Sign-In popup. In-memory token storage. |
-| **Pending Account Admin Gate** | **Fully Functional** | Newly registered users remain `PENDING` until approved by an Administrator. |
-| **Append-Only Credit Ledger** | **Fully Functional** | ACID transactions (`RESERVE` → `SETTLE` / `REFUND`) prevent overspending and automatically refund failed API calls. |
-| **30-Day Carry-Forward Recharge** | **Fully Functional** | Manual `bKash`, `Nagad`, and `Rocket` submission with TrxID uniqueness check, private screenshot upload, admin approval/rejection, credit carry-forward, and 30-day validity reset. |
-| **Admin Financial & Usage Console** | **Fully Functional** | BDT revenue, separate USD provider cost tracking, admin-reconciled wallet estimate, Recharts daily/feature analytics, CSV exports, model/tool switches, and audit logs. |
-| **Direct OpenAI API Billing** | **Ready for `OPENAI_API_KEY`** | Uses official `openai` SDK on the server when `OPENAI_API_KEY` is set; transparently falls back to labeled Sandbox Bridge / Demo Mode when `OPENAI_API_KEY` is unconfigured. |
+| **Append-Only Credit Ledger** | **Fully Functional** | ACID transactions (`RESERVE` → `SETTLE` / `REFUND`) prevent overspending and automatically refund failed/503 API calls. |
+| **30-Day Carry-Forward Recharge** | **Fully Functional** | Manual `bKash`, `Nagad`, and `Rocket` submission (`20 / 50 / 100 / 200 BDT`) with TrxID uniqueness check, private screenshot upload, admin approval/rejection, credit carry-forward, and 30-day validity reset. |
+| **Admin Financial & Usage Console** | **Fully Functional** | BDT revenue, separate USD provider cost tracking, admin-reconciled wallet estimate, Recharts daily/feature analytics, CSV exports, model/tool switches, announcements, and audit logs. |
+| **HTTP 503 Overload Resilience** | **Fully Functional** | Automatic exponential backoff retry and secondary model failover protect chat, image, STT, and TTS calls during transient provider overload. |
+| **Direct OpenAI API Billing** | **Ready for `OPENAI_API_KEY`** | Uses official `openai` SDK on the server when `OPENAI_API_KEY` is set; transparently uses labeled Sandbox Bridge / Demo Mode when `OPENAI_API_KEY` is unconfigured. |
+

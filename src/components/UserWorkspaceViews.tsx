@@ -104,6 +104,9 @@ export function detectNonChatCommand(prompt: string): {
 export function ChatWorkspaceView({
   workspace,
   isGuest = false,
+  selectedModelId,
+  reasoningEffort = 'medium',
+  onChangeReasoningEffort,
   activeSession,
   streamingText,
   isStreaming,
@@ -127,6 +130,9 @@ export function ChatWorkspaceView({
 }: {
   workspace: WorkspacePayload;
   isGuest?: boolean;
+  selectedModelId?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high';
+  onChangeReasoningEffort?: (effort: 'low' | 'medium' | 'high') => void;
   activeSession: ChatSessionDTO | null;
   streamingText: string;
   isStreaming: boolean;
@@ -166,6 +172,24 @@ export function ChatWorkspaceView({
   const [quickMethod, setQuickMethod] = useState<PaymentMethodType>('bKash');
 
   const messages: ChatMessageDTO[] = activeSession?.messages || [];
+
+  const activeModelConfig =
+    workspace.config.models.find((m) => m.id === selectedModelId) ||
+    workspace.config.models.find((m) => m.enabled && m.available !== false) ||
+    workspace.config.models[0];
+
+  const supportsReasoningControl =
+    activeModelConfig?.tier === 'openai-reasoning' ||
+    activeModelConfig?.id === 'gemini-3.8-flash';
+
+  const conversationCreditsTotal = messages.reduce(
+    (sum, m) => sum + (m.creditsCharged || 0),
+    0
+  );
+  const conversationTokensTotal = messages.reduce(
+    (sum, m) => sum + (m.tokensUsed || 0),
+    0
+  );
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -613,6 +637,21 @@ export function ChatWorkspaceView({
             </div>
           ) : (
             <div className="max-w-3xl mx-auto space-y-5 py-2">
+              {!isGuest && activeSession && (
+                <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-semibold text-slate-700 dark:text-slate-200 truncate max-w-xs">
+                    {activeSession.title}
+                  </span>
+                  <div className="flex items-center gap-3 font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                    <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                      Conversation: {conversationCreditsTotal} cr used
+                    </span>
+                    <span>·</span>
+                    <span>{conversationTokensTotal.toLocaleString()} tokens</span>
+                  </div>
+                </div>
+              )}
+
               {messages.map((msg, idx) => {
                 const isUser = msg.role === 'user';
                 const isLastAssistant =
@@ -968,6 +1007,29 @@ export function ChatWorkspaceView({
                   <ImageIcon className="w-3.5 h-3.5" />
                   <span>Image</span>
                 </button>
+
+                {/* Reasoning Effort Control (shown for Reasoning / Thinking models) */}
+                {supportsReasoningControl && onChangeReasoningEffort && (
+                  <div className="flex items-center gap-1 px-2 py-1 rounded-xl border border-slate-200 dark:border-slate-700 text-[11px]">
+                    <span className="text-slate-400 font-medium pl-0.5">
+                      Reasoning:
+                    </span>
+                    {(['low', 'medium', 'high'] as const).map((eff) => (
+                      <button
+                        key={eff}
+                        type="button"
+                        onClick={() => onChangeReasoningEffort(eff)}
+                        className={`px-1.5 py-0.5 rounded-md font-semibold capitalize cursor-pointer ${
+                          reasoningEffort === eff
+                            ? 'bg-emerald-600 text-white'
+                            : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
+                        }`}
+                      >
+                        {eff === 'medium' ? 'Med' : eff}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1361,36 +1423,56 @@ export function HistorySearchPanel({
             No conversations match your search.
           </div>
         ) : (
-          filtered.map((s) => (
-            <div
-              key={s.id}
-              className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center justify-between gap-4"
-            >
-              <button
-                type="button"
-                onClick={() => onSelectSession(s.id)}
-                className="flex-1 text-left min-w-0 cursor-pointer"
+          filtered.map((s) => {
+            const sessCredits = (s.messages || []).reduce(
+              (acc, m) => acc + (m.creditsCharged || 0),
+              0
+            );
+            const sessTokens = (s.messages || []).reduce(
+              (acc, m) => acc + (m.tokensUsed || 0),
+              0
+            );
+            return (
+              <div
+                key={s.id}
+                className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 flex items-center justify-between gap-4"
               >
-                <div className="text-xs text-slate-400 flex items-center gap-2">
-                  <span>{s.model}</span>
-                  <span>·</span>
-                  <span className="capitalize">{s.mode}</span>
-                  <span>·</span>
-                  <span>{new Date(s.updatedAt).toLocaleDateString()}</span>
-                </div>
-                <div className="text-sm font-heading font-bold text-slate-900 dark:text-white truncate mt-0.5">
-                  {s.title}
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => onDeleteSession(s.id)}
-                className="p-2 rounded-lg text-slate-400 hover:text-rose-600 cursor-pointer"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
-          ))
+                <button
+                  type="button"
+                  onClick={() => onSelectSession(s.id)}
+                  className="flex-1 text-left min-w-0 cursor-pointer"
+                >
+                  <div className="text-xs text-slate-400 flex flex-wrap items-center gap-2 font-mono tabular-nums">
+                    <span>{s.model}</span>
+                    <span>·</span>
+                    <span className="capitalize font-sans">{s.mode}</span>
+                    <span>·</span>
+                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                      {sessCredits} cr
+                    </span>
+                    {sessTokens > 0 && (
+                      <>
+                        <span>·</span>
+                        <span>{sessTokens.toLocaleString()} tok</span>
+                      </>
+                    )}
+                    <span>·</span>
+                    <span>{new Date(s.updatedAt).toLocaleDateString()}</span>
+                  </div>
+                  <div className="text-sm font-heading font-bold text-slate-900 dark:text-white truncate mt-0.5">
+                    {s.title}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDeleteSession(s.id)}
+                  className="p-2 rounded-lg text-slate-400 hover:text-rose-600 cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            );
+          })
         )}
       </div>
     </div>
@@ -1477,9 +1559,30 @@ export function ImageStudioPanel({
         onSubmit={handleCreate}
         className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4"
       >
-        <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-          1. Generate New Image
-        </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
+            1. Generate New Image (OpenAI DALL-E 3)
+          </h2>
+          <span
+            className={`text-xs font-semibold ${
+              workspace.capabilities.features.imageGeneration.available
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : 'text-amber-600 dark:text-amber-400'
+            }`}
+          >
+            {workspace.capabilities.features.imageGeneration.available
+              ? 'Active · OpenAI DALL-E 3'
+              : 'Unconfigured · Requires Valid OPENAI_API_KEY'}
+          </span>
+        </div>
+
+        {!workspace.capabilities.features.imageGeneration.available && (
+          <div className="rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/70 px-3.5 py-2.5 text-xs text-amber-800 dark:text-amber-200">
+            {workspace.capabilities.features.imageGeneration.note}. Multimodal
+            Vision Image Analysis below remains active and ready via{' '}
+            {workspace.capabilities.features.imageAnalysis.provider}.
+          </div>
+        )}
         <textarea
           rows={2}
           value={prompt}
@@ -1750,20 +1853,237 @@ export function PdfDocsPanel({
  * ========================================================================== */
 export function VoiceConversationPanel({
   workspace,
+  authToken,
   onTranscribe,
   onVoiceTurn,
   onRequireRecharge,
+  onRefreshWorkspace,
 }: {
   workspace: WorkspacePayload;
+  authToken?: string | null;
   onTranscribe: (b64: string, mime: string) => Promise<string>;
   onVoiceTurn: (spokenPrompt: string) => Promise<void>;
   onRequireRecharge: (reasonMsg: string) => void;
+  onRefreshWorkspace?: () => void;
 }) {
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
   const [manualText, setManualText] = useState('');
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+
+  // Realtime Duplex WebSocket Voice State
+  const [realtimeActive, setRealtimeActive] = useState(false);
+  const [realtimeConnecting, setRealtimeConnecting] = useState(false);
+  const [realtimeProvider, setRealtimeProvider] = useState<'gemini' | 'openai'>(
+    workspace.capabilities.openaiLiveVerified ? 'openai' : 'gemini'
+  );
+  const [realtimeError, setRealtimeError] = useState<string | null>(null);
+  const [realtimeTranscripts, setRealtimeTranscripts] = useState<
+    Array<{ role: 'user' | 'assistant'; text: string }>
+  >([]);
+  const [realtimePromptInput, setRealtimePromptInput] = useState('');
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+
+  const stopRealtimeSession = () => {
+    try {
+      processorRef.current?.disconnect();
+      processorRef.current = null;
+    } catch {
+      // ignore
+    }
+    try {
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    } catch {
+      // ignore
+    }
+    try {
+      wsRef.current?.close();
+      wsRef.current = null;
+    } catch {
+      // ignore
+    }
+    try {
+      audioCtxRef.current?.close();
+      audioCtxRef.current = null;
+    } catch {
+      // ignore
+    }
+    nextPlayTimeRef.current = 0;
+    setRealtimeActive(false);
+    setRealtimeConnecting(false);
+    onRefreshWorkspace?.();
+  };
+
+  useEffect(() => {
+    return () => {
+      stopRealtimeSession();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const playPcm24kBase64 = (base64Data: string, sampleRate = 24000) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const bin = atob(base64Data);
+    const byteLen = bin.length - (bin.length % 2);
+    const int16 = new Int16Array(byteLen / 2);
+    for (let i = 0; i < int16.length; i++) {
+      const lo = bin.charCodeAt(i * 2);
+      const hi = bin.charCodeAt(i * 2 + 1);
+      const val = (hi << 8) | lo;
+      int16[i] = val >= 0x8000 ? val - 0x10000 : val;
+    }
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;
+    }
+    const audioBuf = ctx.createBuffer(1, float32.length, sampleRate);
+    audioBuf.copyToChannel(float32, 0);
+
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime, nextPlayTimeRef.current);
+    src.start(startAt);
+    nextPlayTimeRef.current = startAt + audioBuf.duration;
+  };
+
+  const startRealtimeSession = async () => {
+    const reqCr = workspace.config.creditRates.voiceRealtime || 6;
+    if (
+      !workspace.user.isSubscriptionActive ||
+      workspace.credits.remaining < reqCr
+    ) {
+      onRequireRecharge(
+        `Realtime Duplex Voice requires an active subscription and ${reqCr} credits (${workspace.credits.remaining} available). Please recharge to continue.`
+      );
+      return;
+    }
+    if (!authToken) return;
+
+    setRealtimeError(null);
+    setRealtimeConnecting(true);
+    setRealtimeTranscripts([]);
+
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      const ctx = new AudioCtx({ sampleRate: 16000 });
+      audioCtxRef.current = ctx;
+      nextPlayTimeRef.current = ctx.currentTime;
+
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${proto}://${window.location.host}/api/realtime/voice?token=${encodeURIComponent(
+        authToken
+      )}&provider=${realtimeProvider}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onmessage = async (ev) => {
+        try {
+          const data = JSON.parse(String(ev.data)) as {
+            type?: string;
+            base64?: string;
+            sampleRate?: number;
+            role?: 'user' | 'assistant';
+            text?: string;
+            message?: string;
+            code?: string;
+          };
+
+          if (data.type === 'ready') {
+            setRealtimeConnecting(false);
+            setRealtimeActive(true);
+            try {
+              const micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  channelCount: 1,
+                  sampleRate: 16000,
+                  echoCancellation: true,
+                  noiseSuppression: true,
+                },
+              });
+              micStreamRef.current = micStream;
+              const micSource = ctx.createMediaStreamSource(micStream);
+              const proc = ctx.createScriptProcessor(4096, 1, 1);
+              processorRef.current = proc;
+
+              proc.onaudioprocess = (audioEv) => {
+                if (ws.readyState !== WebSocket.OPEN) return;
+                const inputCh = audioEv.inputBuffer.getChannelData(0);
+                const pcm16 = new Int16Array(inputCh.length);
+                for (let i = 0; i < inputCh.length; i++) {
+                  const s = Math.max(-1, Math.min(1, inputCh[i]));
+                  pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+                }
+                const bytes = new Uint8Array(pcm16.buffer);
+                let bin = '';
+                for (let i = 0; i < bytes.byteLength; i++) {
+                  bin += String.fromCharCode(bytes[i]);
+                }
+                ws.send(JSON.stringify({ type: 'audio', base64: btoa(bin) }));
+              };
+
+              micSource.connect(proc);
+              proc.connect(ctx.destination);
+            } catch {
+              // Microphone permission unavailable — user can still send live text turns over the Realtime socket
+            }
+          } else if (data.type === 'audio' && data.base64) {
+            playPcm24kBase64(data.base64, data.sampleRate || 24000);
+          } else if (data.type === 'transcript' && data.text && data.role) {
+            setRealtimeTranscripts((prev) => {
+              const last = prev[prev.length - 1];
+              if (last && last.role === data.role) {
+                return [
+                  ...prev.slice(0, -1),
+                  { role: data.role!, text: `${last.text}${data.text}` },
+                ];
+              }
+              return [...prev, { role: data.role!, text: data.text! }];
+            });
+          } else if (data.type === 'interrupted') {
+            if (audioCtxRef.current) {
+              nextPlayTimeRef.current = audioCtxRef.current.currentTime;
+            }
+          } else if (data.type === 'error') {
+            if (data.code === 'RECHARGE_REQUIRED') {
+              onRequireRecharge(data.message || 'Please recharge credits.');
+            } else {
+              setRealtimeError(data.message || 'Realtime voice error.');
+            }
+            stopRealtimeSession();
+          }
+        } catch {
+          // ignore parse error
+        }
+      };
+
+      ws.onerror = () => {
+        setRealtimeError('Realtime WebSocket connection interrupted.');
+        stopRealtimeSession();
+      };
+
+      ws.onclose = () => {
+        setRealtimeActive(false);
+        setRealtimeConnecting(false);
+      };
+    } catch (err: unknown) {
+      setRealtimeError(
+        err instanceof Error ? err.message : 'Unable to start Realtime Voice.'
+      );
+      stopRealtimeSession();
+    }
+  };
 
   const checkVoiceCredits = () => {
     const minCr =
@@ -1826,34 +2146,166 @@ export function VoiceConversationPanel({
   };
 
   return (
-    <div className="max-w-2xl mx-auto w-full px-4 sm:px-6 py-8 space-y-6 overflow-y-auto h-full text-center">
+    <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6 overflow-y-auto h-full">
       <div>
         <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-          Voice Conversations (STT + Neural TTS)
+          Voice Studio (Realtime Duplex + STT / Neural TTS)
         </h1>
         <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-          Speak in English or বাংলা ({workspace.config.creditRates.voiceStt} cr
-          STT + {workspace.config.creditRates.voiceTts} cr TTS).
+          Low-latency Realtime Voice ({workspace.config.creditRates.voiceRealtime || 6}{' '}
+          cr/session) or turn-based Speech-to-Text ({workspace.config.creditRates.voiceStt}{' '}
+          cr) + Neural TTS ({workspace.config.creditRates.voiceTts} cr).
         </p>
       </div>
 
-      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-8 flex flex-col items-center space-y-5">
+      {/* 1. Realtime Duplex Voice Card (WebSocket PCM Audio) */}
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
+              1. Realtime Duplex Voice Session
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Bi-directional live audio streaming with instant spoken replies.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <select
+              value={realtimeProvider}
+              disabled={realtimeActive || realtimeConnecting}
+              onChange={(e) =>
+                setRealtimeProvider(e.target.value as 'gemini' | 'openai')
+              }
+              className="px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100"
+            >
+              {workspace.capabilities.geminiConfigured && (
+                <option value="gemini">Google Gemini 3.8 Live (Ready)</option>
+              )}
+              <option value="openai">
+                OpenAI Realtime API{' '}
+                {workspace.capabilities.openaiLiveVerified
+                  ? '(Ready)'
+                  : '(Requires Valid OPENAI_API_KEY)'}
+              </option>
+            </select>
+
+            {realtimeActive || realtimeConnecting ? (
+              <button
+                type="button"
+                onClick={stopRealtimeSession}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold cursor-pointer"
+              >
+                End Live Session
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={!workspace.config.toolsEnabled.voiceChat}
+                onClick={startRealtimeSession}
+                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-semibold cursor-pointer"
+              >
+                Start Live Voice ({workspace.config.creditRates.voiceRealtime || 6} cr)
+              </button>
+            )}
+          </div>
+        </div>
+
+        {realtimeConnecting && (
+          <div className="flex items-center gap-2 text-xs text-emerald-600">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span>Connecting secure Realtime Voice socket...</span>
+          </div>
+        )}
+
+        {realtimeActive && (
+          <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-semibold text-emerald-600 dark:text-emerald-400">
+                ● Live Audio Connected — Speak naturally into your microphone
+              </span>
+            </div>
+
+            {realtimeTranscripts.length > 0 && (
+              <div className="max-h-44 overflow-y-auto space-y-2 rounded-xl bg-slate-50 dark:bg-slate-800/70 p-3 text-xs">
+                {realtimeTranscripts.map((t, idx) => (
+                  <div key={idx}>
+                    <span className="font-bold text-slate-900 dark:text-white">
+                      {t.role === 'user' ? 'You: ' : 'QAAGA: '}
+                    </span>
+                    <span className="text-slate-600 dark:text-slate-300">
+                      {t.text}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (
+                  !realtimePromptInput.trim() ||
+                  !wsRef.current ||
+                  wsRef.current.readyState !== WebSocket.OPEN
+                ) {
+                  return;
+                }
+                const msg = realtimePromptInput.trim();
+                setRealtimeTranscripts((prev) => [
+                  ...prev,
+                  { role: 'user', text: msg },
+                ]);
+                wsRef.current.send(JSON.stringify({ type: 'text', text: msg }));
+                setRealtimePromptInput('');
+              }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={realtimePromptInput}
+                onChange={(e) => setRealtimePromptInput(e.target.value)}
+                placeholder="Send a prompt into the live voice stream..."
+                className="flex-1 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-900 dark:text-white"
+              />
+              <button
+                type="submit"
+                className="px-3.5 py-1.5 rounded-xl bg-emerald-600 text-white text-xs font-semibold cursor-pointer"
+              >
+                Speak Live
+              </button>
+            </form>
+          </div>
+        )}
+
+        {realtimeError && (
+          <p className="text-xs text-rose-600 dark:text-rose-400">
+            {realtimeError}
+          </p>
+        )}
+      </div>
+
+      {/* 2. Turn-Based STT + Neural TTS Card */}
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 flex flex-col items-center space-y-4 text-center">
+        <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white self-start">
+          2. Turn-Based Dictation & Neural Speech Reply
+        </h2>
         <button
           type="button"
           disabled={busy || !workspace.config.toolsEnabled.voiceChat}
           onClick={toggle}
-          className={`w-20 h-20 rounded-full flex items-center justify-center text-white shadow-md transition-transform cursor-pointer ${
+          className={`w-16 h-16 rounded-full flex items-center justify-center text-white shadow-md transition-transform cursor-pointer ${
             recording
               ? 'bg-rose-600 scale-105'
               : 'bg-emerald-600 hover:bg-emerald-700'
           } disabled:opacity-45`}
         >
           {busy ? (
-            <Loader2 className="w-8 h-8 animate-spin" />
+            <Loader2 className="w-7 h-7 animate-spin" />
           ) : recording ? (
-            <Square className="w-7 h-7 fill-current" />
+            <Square className="w-6 h-6 fill-current" />
           ) : (
-            <Mic className="w-8 h-8" />
+            <Mic className="w-7 h-7" />
           )}
         </button>
         <p className="text-xs text-slate-500">
@@ -1861,7 +2313,7 @@ export function VoiceConversationPanel({
             ? 'Recording microphone... click again to send'
             : busy
             ? 'Processing voice turn & synthesizing audio reply...'
-            : 'Tap microphone to speak'}
+            : 'Tap microphone to dictate'}
         </p>
 
         <form
@@ -1878,7 +2330,7 @@ export function VoiceConversationPanel({
               setBusy(false);
             }
           }}
-          className="w-full flex gap-2 pt-2"
+          className="w-full flex gap-2 pt-1"
         >
           <input
             type="text"
@@ -2067,10 +2519,10 @@ export function ProfileSettingsPanel({
               className="w-full px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm text-slate-900 dark:text-white"
             >
               {workspace.config.models
-                .filter((m) => m.enabled)
+                .filter((m) => m.enabled && m.available !== false)
                 .map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.label}
+                    {m.label} ({m.baseCreditCost} cr)
                   </option>
                 ))}
             </select>

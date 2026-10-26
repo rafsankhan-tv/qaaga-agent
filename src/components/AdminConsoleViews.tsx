@@ -43,6 +43,7 @@ import type {
   NavSection,
   PlatformConfigDTO,
   ProviderCapabilitiesDTO,
+  ProviderDiagnosticsDTO,
   RechargePackageDTO,
 } from '../types/qaaga';
 import { UserAvatarBadge } from './BrandIcons';
@@ -73,6 +74,8 @@ export function AdminConsoleViews({
   onUpdatePackage,
   onBroadcastAnnouncement,
   onSaveConfig,
+  onTestOpenAI,
+  onTestProviders,
 }: {
   section: NavSection;
   onSelectSection: (s: NavSection) => void;
@@ -121,6 +124,16 @@ export function AdminConsoleViews({
   ) => Promise<void>;
   onBroadcastAnnouncement: (title: string, detail: string) => Promise<void>;
   onSaveConfig: (next: PlatformConfigDTO) => Promise<void>;
+  onTestOpenAI?: () => Promise<{
+    ok: boolean;
+    keyPresent: boolean;
+    status: number | null;
+    errorCode: string | null;
+    message: string;
+    latencyMs: number;
+    availableTargetModels: string[];
+  }>;
+  onTestProviders?: () => Promise<ProviderDiagnosticsDTO>;
 }) {
   const [exportOpen, setExportOpen] = useState(false);
   const [chartMetric, setChartMetric] = useState<'credits' | 'usdCost' | 'requests'>('credits');
@@ -162,6 +175,18 @@ export function AdminConsoleViews({
 
   // Audit / Log Search
   const [logSearch, setLogSearch] = useState('');
+  const [testingOpenAI, setTestingOpenAI] = useState(false);
+  const [openAITestResult, setOpenAITestResult] = useState<{
+    ok: boolean;
+    keyPresent: boolean;
+    status: number | null;
+    errorCode: string | null;
+    message: string;
+    latencyMs: number;
+    availableTargetModels: string[];
+  } | null>(null);
+  const [providerDiagResult, setProviderDiagResult] =
+    useState<ProviderDiagnosticsDTO | null>(null);
 
   useEffect(() => {
     setDraftConfig(config);
@@ -180,11 +205,11 @@ export function AdminConsoleViews({
 
   const exportUsersCsv = () => {
     const header =
-      'ID,Full Name,Email,Role,Status,Expired,Assigned Credits,Used Credits,Remaining Credits,Chat,Image,PDF,Search,Voice\n';
+      'ID,Full Name,Email,Role,Status,Expired,Assigned Credits,Used Credits,Remaining Credits,Daily Limit,Used Today,OpenAI USD,Gemini USD,Total API USD,Chat,Image,PDF,Search,Voice\n';
     const rows = dashboard.users
       .map(
         (u) =>
-          `${u.id},"${u.fullName}",${u.email},${u.role},${u.status},${u.isExpired},${u.creditsAssigned},${u.creditsUsed},${u.creditsRemaining},${u.chatCredits},${u.imageCredits},${u.pdfCredits},${u.searchCredits},${u.voiceCredits}`
+          `${u.id},"${u.fullName}",${u.email},${u.role},${u.status},${u.isExpired},${u.creditsAssigned},${u.creditsUsed},${u.creditsRemaining},${u.dailyCreditLimit},${u.usedTodayCredits},${(u.openaiUsdCost ?? 0).toFixed(6)},${(u.geminiUsdCost ?? 0).toFixed(6)},${(u.totalUsdCost ?? 0).toFixed(6)},${u.chatCredits},${u.imageCredits},${u.pdfCredits},${u.searchCredits},${u.voiceCredits}`
       )
       .join('\n');
     downloadCsv('qaaga-users-report.csv', header + rows);
@@ -418,9 +443,16 @@ export function AdminConsoleViews({
         )
       : 0;
 
+  const totalProviderUsd = kpis.totalProviderUsedUsd ?? kpis.openaiUsedUsd;
+  const todayProviderUsd =
+    (kpis.openaiTodayUsd ?? 0) + (kpis.geminiTodayUsd ?? 0);
   const spendPct =
     kpis.monthlySpendLimitUsd > 0
-      ? Math.round((kpis.openaiUsedUsd / kpis.monthlySpendLimitUsd) * 100)
+      ? Math.round((totalProviderUsd / kpis.monthlySpendLimitUsd) * 100)
+      : 0;
+  const dailySpendPct =
+    (kpis.dailySpendLimitUsd ?? 0) > 0
+      ? Math.round((todayProviderUsd / kpis.dailySpendLimitUsd) * 100)
       : 0;
 
   const poolTotal = Math.max(1, creditPool.totalAssigned);
@@ -577,11 +609,18 @@ export function AdminConsoleViews({
         </div>
 
         {/* Spend Cap Alert if Triggered */}
-        {spendPct >= config.openaiWallet.alertThresholdPct && (
+        {(spendPct >= config.openaiWallet.alertThresholdPct ||
+          dailySpendPct >= config.openaiWallet.alertThresholdPct) && (
           <div className="rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 px-4 py-3 text-xs text-amber-800 dark:text-amber-200 flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>
-              <strong>Monthly API Spend Alert:</strong> Measured usage (${kpis.openaiUsedUsd.toFixed(4)} USD) is at {spendPct}% of your ${kpis.monthlySpendLimitUsd.toFixed(2)} USD cap.
+              <strong>API Spend Alert:</strong> Total provider spend ($
+              {totalProviderUsd.toFixed(4)} USD · OpenAI $
+              {kpis.openaiUsedUsd.toFixed(4)} · Gemini $
+              {(kpis.geminiUsedUsd ?? 0).toFixed(4)}) is at {spendPct}% of your
+              monthly cap (${kpis.monthlySpendLimitUsd.toFixed(2)}) and{' '}
+              {dailySpendPct}% of your daily cap ($
+              {(kpis.dailySpendLimitUsd ?? 15).toFixed(2)}).
             </span>
           </div>
         )}
@@ -690,12 +729,16 @@ export function AdminConsoleViews({
             </p>
             <div className="mt-1 flex items-baseline justify-between gap-1">
               <span className="text-xl font-heading font-extrabold tabular-nums text-slate-900 dark:text-white">
-                ${kpis.openaiUsedUsd.toFixed(2)}
+                ${totalProviderUsd.toFixed(2)}
               </span>
               <span className="text-[10.5px] font-mono text-sky-700 dark:text-sky-400">
                 {(kpis.totalTokensUsed / 1000).toFixed(1)}k tok
               </span>
             </div>
+            <p className="text-[10px] font-mono text-slate-500 mt-0.5 truncate">
+              OAI ${kpis.openaiUsedUsd.toFixed(2)} · Gem $
+              {(kpis.geminiUsedUsd ?? 0).toFixed(2)}
+            </p>
           </button>
 
           {/* 6. OpenAI Balance (Reconciled Estimate) */}
@@ -1426,6 +1469,7 @@ export function AdminConsoleViews({
                   <th className="py-3 px-4">User</th>
                   <th className="py-3 px-3">Status & Expiry</th>
                   <th className="py-3 px-3 text-right">Assigned / Used / Rem</th>
+                  <th className="py-3 px-3 text-right">API Cost (OAI / Gem)</th>
                   <th className="py-3 px-3 text-right">
                     Chat · Img · PDF · Web · Voice
                   </th>
@@ -1477,52 +1521,68 @@ export function AdminConsoleViews({
                       </span>
                     </td>
 
+                    <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                      <div className="font-semibold text-slate-900 dark:text-white">
+                        ${(u.openaiUsdCost ?? 0).toFixed(4)} / $
+                        {(u.geminiUsdCost ?? 0).toFixed(4)}
+                      </div>
+                      <div className="text-[10.5px] text-slate-400">
+                        {u.apiRequests ?? 0} req ·{' '}
+                        {(u.totalTokens ?? 0).toLocaleString()} tok
+                      </div>
+                    </td>
+
                     <td className="py-3 px-3 text-right font-mono tabular-nums text-slate-500 whitespace-nowrap">
                       {u.chatCredits} · {u.imageCredits} · {u.pdfCredits} ·{' '}
                       {u.searchCredits} · {u.voiceCredits}
                     </td>
 
                     <td className="py-3 px-3">
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="number"
-                          value={userLimits[u.id] ?? u.dailyCreditLimit}
-                          onChange={(e) =>
-                            setUserLimits((prev) => ({
-                              ...prev,
-                              [u.id]: Number(e.target.value),
-                            }))
-                          }
-                          className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs"
-                          title="Daily credit limit"
-                        />
-                        <input
-                          type="number"
-                          placeholder="+cr"
-                          value={userBonus[u.id] ?? ''}
-                          onChange={(e) =>
-                            setUserBonus((prev) => ({
-                              ...prev,
-                              [u.id]: Number(e.target.value),
-                            }))
-                          }
-                          className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs"
-                          title="Grant bonus credits"
-                        />
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            await onManageUser(u.id, {
-                              dailyCreditLimit:
-                                userLimits[u.id] ?? u.dailyCreditLimit,
-                              bonusCredits: userBonus[u.id] || 0,
-                            });
-                            setUserBonus((prev) => ({ ...prev, [u.id]: 0 }));
-                          }}
-                          className="px-2 py-1 rounded-lg bg-slate-900 dark:bg-emerald-700 text-white text-[11px] font-semibold cursor-pointer"
-                        >
-                          Apply
-                        </button>
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="number"
+                            value={userLimits[u.id] ?? u.dailyCreditLimit}
+                            onChange={(e) =>
+                              setUserLimits((prev) => ({
+                                ...prev,
+                                [u.id]: Number(e.target.value),
+                              }))
+                            }
+                            className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs"
+                            title="Daily credit limit"
+                          />
+                          <input
+                            type="number"
+                            placeholder="+cr"
+                            value={userBonus[u.id] ?? ''}
+                            onChange={(e) =>
+                              setUserBonus((prev) => ({
+                                ...prev,
+                                [u.id]: Number(e.target.value),
+                              }))
+                            }
+                            className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs"
+                            title="Grant bonus credits"
+                          />
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              await onManageUser(u.id, {
+                                dailyCreditLimit:
+                                  userLimits[u.id] ?? u.dailyCreditLimit,
+                                bonusCredits: userBonus[u.id] || 0,
+                              });
+                              setUserBonus((prev) => ({ ...prev, [u.id]: 0 }));
+                            }}
+                            className="px-2 py-1 rounded-lg bg-slate-900 dark:bg-emerald-700 text-white text-[11px] font-semibold cursor-pointer"
+                          >
+                            Apply
+                          </button>
+                        </div>
+                        <div className="text-[10.5px] font-mono text-slate-400">
+                          Today: {u.usedTodayCredits} / {u.dailyCreditLimit} cr
+                        </div>
                       </div>
                     </td>
 
@@ -1968,6 +2028,7 @@ export function AdminConsoleViews({
                 ['webSearch', 'Web Search'],
                 ['voiceStt', 'Speech-to-Text'],
                 ['voiceTts', 'Text-to-Speech'],
+                ['voiceRealtime', 'Realtime Duplex Voice'],
               ] as const
             ).map(([key, label]) => (
               <div key={key}>
@@ -1975,7 +2036,7 @@ export function AdminConsoleViews({
                 <input
                   type="number"
                   min={1}
-                  value={draftConfig.creditRates[key]}
+                  value={draftConfig.creditRates[key] ?? 12}
                   onChange={(e) =>
                     setDraftConfig({
                       ...draftConfig,
@@ -2018,15 +2079,19 @@ export function AdminConsoleViews({
    * 6. API USAGE ANALYTICS (`admin-api-usage`)
    * ======================================================================== */
   if (section === 'admin-api-usage') {
+    const usersSortedBySpend = [...dashboard.users].sort(
+      (a, b) => (b.totalUsdCost ?? 0) - (a.totalUsdCost ?? 0)
+    );
+
     return (
       <div className="max-w-6xl mx-auto w-full px-4 sm:px-6 py-6 space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-              API Usage & Per-Model Telemetry
+              API Usage & Multi-Provider Telemetry
             </h1>
             <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-              Compare internal platform credits charged against real provider token consumption and USD cost.
+              Monitor OpenAI API USD spending and Google Gemini API USD spending separately alongside per-user consumption.
             </p>
           </div>
           <button
@@ -2037,6 +2102,42 @@ export function AdminConsoleViews({
             <Download className="w-3.5 h-3.5" />
             <span>Export Usage CSV</span>
           </button>
+        </div>
+
+        {/* Separate OpenAI vs Gemini Spend Summary */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">OpenAI API Spending (USD)</p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-700 dark:text-emerald-400 mt-1">
+              ${kpis.openaiUsedUsd.toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.openaiTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">
+              Google Gemini API Spending (USD)
+            </p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-sky-600 dark:text-sky-400 mt-1">
+              ${(kpis.geminiUsedUsd ?? 0).toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.geminiTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">
+              Combined Provider Spend & Caps
+            </p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-slate-900 dark:text-white mt-1">
+              ${totalProviderUsd.toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Daily Cap ${(kpis.dailySpendLimitUsd ?? 15).toFixed(2)} · Monthly
+              Cap ${kpis.monthlySpendLimitUsd.toFixed(2)}
+            </p>
+          </div>
         </div>
 
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
@@ -2065,7 +2166,7 @@ export function AdminConsoleViews({
                     <td className="py-2.5 px-4 font-mono font-semibold text-slate-900 dark:text-white">
                       {m.model}
                     </td>
-                    <td className="py-2.5 px-4 uppercase text-slate-500">
+                    <td className="py-2.5 px-4 uppercase font-semibold text-slate-500">
                       {m.provider}
                     </td>
                     <td className="py-2.5 px-4 text-right font-mono tabular-nums">
@@ -2088,10 +2189,13 @@ export function AdminConsoleViews({
         </div>
 
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
-          <div className="p-4 border-b border-slate-100 dark:border-slate-800">
+          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
             <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-              Top API Usage Users
+              Individual User API Consumption (OpenAI vs Gemini)
             </h2>
+            <span className="text-xs font-mono text-slate-400">
+              {usersSortedBySpend.length} accounts
+            </span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse text-xs">
@@ -2099,15 +2203,17 @@ export function AdminConsoleViews({
                 <tr className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-100 dark:border-slate-800 text-slate-500">
                   <th className="py-2.5 px-4">#</th>
                   <th className="py-2.5 px-4">User</th>
-                  <th className="py-2.5 px-4 text-right">Requests</th>
-                  <th className="py-2.5 px-4 text-right">Tokens</th>
-                  <th className="py-2.5 px-4 text-right">API Cost (USD)</th>
-                  <th className="py-2.5 px-4 text-right">Credits Charged</th>
+                  <th className="py-2.5 px-3 text-right">Requests</th>
+                  <th className="py-2.5 px-3 text-right">Tokens</th>
+                  <th className="py-2.5 px-3 text-right">OpenAI (USD)</th>
+                  <th className="py-2.5 px-3 text-right">Gemini (USD)</th>
+                  <th className="py-2.5 px-3 text-right">Total API (USD)</th>
+                  <th className="py-2.5 px-4 text-right">Credits Used</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {dashboard.topApiUsers.map((u, i) => (
-                  <tr key={u.userId}>
+                {usersSortedBySpend.map((u, i) => (
+                  <tr key={u.id}>
                     <td className="py-2.5 px-4 font-mono text-slate-500">
                       {i + 1}
                     </td>
@@ -2117,17 +2223,23 @@ export function AdminConsoleViews({
                         ({u.email})
                       </span>
                     </td>
-                    <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                      {u.requests}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
+                      {u.apiRequests ?? 0}
                     </td>
-                    <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                      {u.tokens.toLocaleString()}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums">
+                      {(u.totalTokens ?? 0).toLocaleString()}
                     </td>
-                    <td className="py-2.5 px-4 text-right font-mono font-bold tabular-nums text-slate-900 dark:text-white">
-                      ${u.usdCost.toFixed(4)}
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
+                      ${(u.openaiUsdCost ?? 0).toFixed(4)}
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-sky-600 dark:text-sky-400">
+                      ${(u.geminiUsdCost ?? 0).toFixed(4)}
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-slate-900 dark:text-white">
+                      ${(u.totalUsdCost ?? 0).toFixed(4)}
                     </td>
                     <td className="py-2.5 px-4 text-right font-mono font-bold tabular-nums text-emerald-600">
-                      {u.creditsCharged} cr
+                      {u.creditsUsed} cr
                     </td>
                   </tr>
                 ))}
@@ -2140,48 +2252,67 @@ export function AdminConsoleViews({
   }
 
   /* ==========================================================================
-   * 7. OPENAI BILLING & RECONCILIATION (`admin-openai-billing`)
+   * 7. PROVIDER BILLING, SPEND CAPS & CONNECTIVITY (`admin-openai-billing`)
    * ======================================================================== */
   if (section === 'admin-openai-billing') {
+    const providerErrors = dashboard.providerErrors ?? [];
+    const activeOpenAIDiag = providerDiagResult?.openai || openAITestResult;
+
     return (
-      <div className="max-w-4xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
+      <div className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
         <div>
           <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-            OpenAI API Billing & Spend Guardrails
+            Provider API Billing, Spend Caps & Connectivity
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-            {kpis.walletSourceLabel}
+            {kpis.walletSourceLabel} · Separate OpenAI & Google Gemini USD tracking with daily and monthly hard caps.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5">
-            <p className="text-xs text-slate-500">Purchased API Budget (USD)</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">OpenAI API Spend (USD)</p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-700 dark:text-emerald-400 mt-1">
+              ${kpis.openaiUsedUsd.toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.openaiTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">Gemini API Spend (USD)</p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-sky-600 dark:text-sky-400 mt-1">
+              ${(kpis.geminiUsedUsd ?? 0).toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.geminiTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">Purchased OpenAI Budget</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-slate-900 dark:text-white mt-1">
               ${kpis.openaiPurchasedUsd.toFixed(2)}
             </p>
-          </div>
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5">
-            <p className="text-xs text-slate-500">Measured Provider Spend</p>
-            <p className="text-2xl font-mono font-extrabold tabular-nums text-amber-600 mt-1">
-              ${kpis.openaiUsedUsd.toFixed(4)}
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Admin reconciled wallet
             </p>
           </div>
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5">
-            <p className="text-xs text-slate-500">
-              Remaining Balance (Reconciled Est.)
-            </p>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">OpenAI Balance (Est.)</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-600 mt-1">
               ${kpis.openaiRemainingEstimatedUsd.toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              {openaiRemainingPct}% remaining
             </p>
           </div>
         </div>
 
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4">
           <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-            Configure Purchased Budget, Monthly Hard Cap & Alert Threshold
+            Configure Purchased Budget, Daily Cap, Monthly Hard Cap & Alert Threshold
           </h2>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
             <div>
               <label className="block text-slate-500 mb-1">
                 Purchased OpenAI Credit (USD)
@@ -2196,6 +2327,26 @@ export function AdminConsoleViews({
                     openaiWallet: {
                       ...draftConfig.openaiWallet,
                       purchasedUsd: Number(e.target.value),
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-500 mb-1">
+                Daily Spend Hard Cap (USD)
+              </label>
+              <input
+                type="number"
+                step="0.01"
+                value={draftConfig.openaiWallet.dailySpendLimitUsd ?? 15}
+                onChange={(e) =>
+                  setDraftConfig({
+                    ...draftConfig,
+                    openaiWallet: {
+                      ...draftConfig.openaiWallet,
+                      dailySpendLimitUsd: Number(e.target.value),
                     },
                   })
                 }
@@ -2245,17 +2396,157 @@ export function AdminConsoleViews({
             </div>
           </div>
 
-          <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-3.5 text-xs text-slate-600 dark:text-slate-300">
-            <strong>Active Execution Mode:</strong>{' '}
-            {capabilities.openaiConfigured
-              ? 'OpenAI Live API Connected'
-              : 'Server Sandbox Bridge Active (Set OPENAI_API_KEY in Secrets to switch to direct OpenAI billing)'}
+          <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-4 space-y-3 text-xs text-slate-600 dark:text-slate-300">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <div>
+                  <strong>OpenAI API Status:</strong>{' '}
+                  {capabilities.openaiLiveVerified
+                    ? 'Live Verified (OPENAI_API_KEY Active · Strict Provider Isolation)'
+                    : capabilities.openaiConfigured
+                    ? `OPENAI_API_KEY Present · Unverified (${
+                        capabilities.openaiDiscovery?.message ||
+                        'Check API key in Settings > Secrets'
+                      })`
+                    : 'OPENAI_API_KEY Not Set in Server Environment'}
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  Note: OpenAI API model access depends on your API organization tier & prepaid API credits, not consumer ChatGPT Plus/Pro subscriptions.
+                </div>
+              </div>
+              {(onTestProviders || onTestOpenAI) && (
+                <button
+                  type="button"
+                  disabled={testingOpenAI}
+                  onClick={async () => {
+                    setTestingOpenAI(true);
+                    try {
+                      if (onTestProviders) {
+                        const diag = await onTestProviders();
+                        setProviderDiagResult(diag);
+                      } else if (onTestOpenAI) {
+                        const res = await onTestOpenAI();
+                        setOpenAITestResult(res);
+                      }
+                    } finally {
+                      setTestingOpenAI(false);
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${
+                      testingOpenAI ? 'animate-spin' : ''
+                    }`}
+                  />
+                  <span>
+                    {testingOpenAI
+                      ? 'Testing Providers...'
+                      : 'Test OpenAI & Gemini Connectivity'}
+                  </span>
+                </button>
+              )}
+            </div>
+
+            {activeOpenAIDiag && (
+              <div
+                className={`rounded-xl border p-3 space-y-1.5 ${
+                  activeOpenAIDiag.ok
+                    ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                    : 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                  <span>
+                    {activeOpenAIDiag.ok
+                      ? 'OpenAI API Live Connection Verified'
+                      : `OpenAI API Connection Failed${
+                          activeOpenAIDiag.status
+                            ? ` (HTTP ${activeOpenAIDiag.status})`
+                            : ''
+                        }`}
+                  </span>
+                  <span className="font-mono text-[11px]">
+                    {activeOpenAIDiag.latencyMs} ms
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed">
+                  {activeOpenAIDiag.message}
+                </p>
+                {providerDiagResult?.openai ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1 font-mono text-[11px] opacity-90">
+                    <div>
+                      Reasoning:{' '}
+                      {providerDiagResult.openai.categorizedModels.reasoning.join(
+                        ', '
+                      ) || 'None'}
+                    </div>
+                    <div>
+                      Standard:{' '}
+                      {providerDiagResult.openai.categorizedModels.standard.join(
+                        ', '
+                      ) || 'None'}
+                    </div>
+                    <div>
+                      Economical:{' '}
+                      {providerDiagResult.openai.categorizedModels.economical.join(
+                        ', '
+                      ) || 'None'}
+                    </div>
+                    <div>
+                      Image / Realtime:{' '}
+                      {[
+                        ...providerDiagResult.openai.categorizedModels.image,
+                        ...providerDiagResult.openai.categorizedModels.realtime,
+                      ].join(', ') || 'None'}
+                    </div>
+                  </div>
+                ) : (
+                  activeOpenAIDiag.availableTargetModels.length > 0 && (
+                    <p className="font-mono text-[11px] opacity-90">
+                      Verified Models:{' '}
+                      {activeOpenAIDiag.availableTargetModels.join(', ')}
+                    </p>
+                  )
+                )}
+              </div>
+            )}
+
+            {providerDiagResult?.gemini && (
+              <div
+                className={`rounded-xl border p-3 space-y-1.5 ${
+                  providerDiagResult.gemini.ok
+                    ? 'bg-sky-50/70 dark:bg-sky-950/30 border-sky-200 dark:border-sky-800 text-sky-900 dark:text-sky-200'
+                    : 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                  <span>
+                    {providerDiagResult.gemini.ok
+                      ? 'Google Gemini API Live Connection Verified'
+                      : 'Google Gemini API Connection Failed'}
+                  </span>
+                  <span className="font-mono text-[11px]">
+                    {providerDiagResult.gemini.latencyMs} ms
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed">
+                  {providerDiagResult.gemini.message}
+                </p>
+                {providerDiagResult.gemini.availableModels.length > 0 && (
+                  <p className="font-mono text-[11px] opacity-90">
+                    Available Gemini Models:{' '}
+                    {providerDiagResult.gemini.availableModels.join(', ')}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex justify-end items-center gap-3">
             {configSaved && (
               <span className="text-xs font-semibold text-emerald-600">
-                Budget Saved!
+                Billing Guardrails Saved!
               </span>
             )}
             <button
@@ -2271,6 +2562,64 @@ export function AdminConsoleViews({
               <span>Save Billing Guardrails</span>
             </button>
           </div>
+        </div>
+
+        {/* Provider Connectivity & API Errors Log */}
+        <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+            <div>
+              <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
+                Provider Connectivity & API Error Log
+              </h2>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Every failed OpenAI or Gemini call is logged here with sanitized error details and triggers an automatic 100% user credit refund.
+              </p>
+            </div>
+            <span className="text-xs font-mono text-slate-400">
+              {providerErrors.length} recent errors
+            </span>
+          </div>
+          {providerErrors.length === 0 ? (
+            <div className="p-6 text-center text-xs text-slate-400">
+              No provider API errors recorded.
+            </div>
+          ) : (
+            <div className="overflow-x-auto max-h-80">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-100 dark:border-slate-800 text-slate-500">
+                    <th className="py-2.5 px-4">Timestamp</th>
+                    <th className="py-2.5 px-3">Provider</th>
+                    <th className="py-2.5 px-3">Model</th>
+                    <th className="py-2.5 px-3">Status / Code</th>
+                    <th className="py-2.5 px-4">Sanitized Error Message</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {providerErrors.map((err) => (
+                    <tr key={err.id}>
+                      <td className="py-2 px-4 font-mono text-slate-500 whitespace-nowrap">
+                        {new Date(err.createdAt).toLocaleString()}
+                      </td>
+                      <td className="py-2 px-3 font-mono uppercase font-semibold text-slate-700 dark:text-slate-300">
+                        {err.provider}
+                      </td>
+                      <td className="py-2 px-3 font-mono text-slate-600 dark:text-slate-300">
+                        {err.model}
+                      </td>
+                      <td className="py-2 px-3 font-mono text-rose-600 whitespace-nowrap">
+                        {err.status ? `HTTP ${err.status}` : 'ERR'}
+                        {err.errorCode ? ` · ${err.errorCode}` : ''}
+                      </td>
+                      <td className="py-2 px-4 text-slate-600 dark:text-slate-300 max-w-md truncate">
+                        {err.message}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -2579,56 +2928,150 @@ export function AdminConsoleViews({
 
       {/* Models */}
       <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 space-y-3">
-        <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-          Available AI Models
-        </h2>
-        {draftConfig.models.map((m, idx) => (
-          <div
-            key={m.id}
-            className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 dark:border-slate-800 text-xs"
-          >
-            <div>
-              <span className="font-bold text-slate-900 dark:text-white">
-                {m.label}
-              </span>{' '}
-              <span className="font-mono text-slate-400">({m.id})</span>
-            </div>
-            <div className="flex items-center gap-3">
-              <label className="flex items-center gap-1.5">
-                <span className="text-slate-500">Base cr:</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={m.baseCreditCost}
-                  onChange={(e) => {
-                    const next = [...draftConfig.models];
-                    next[idx] = {
-                      ...m,
-                      baseCreditCost: Number(e.target.value),
-                    };
-                    setDraftConfig({ ...draftConfig, models: next });
-                  }}
-                  className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono"
-                />
-              </label>
-              <button
-                type="button"
-                onClick={() => {
-                  const next = [...draftConfig.models];
-                  next[idx] = { ...m, enabled: !m.enabled };
-                  setDraftConfig({ ...draftConfig, models: next });
-                }}
-                className={`px-3 py-1 rounded-lg font-semibold cursor-pointer ${
-                  m.enabled
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-slate-200 dark:bg-slate-800 text-slate-600'
-                }`}
-              >
-                {m.enabled ? 'Enabled' : 'Disabled'}
-              </button>
-            </div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
+              OpenAI & Google Gemini Model Catalog, Pricing & Credit Rates
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Enable or disable models, set user credit charges per request/1K tokens, and configure provider USD rates. End users only see models that are both Enabled and Live Available.
+            </p>
           </div>
-        ))}
+        </div>
+
+        <div className="space-y-2.5">
+          {draftConfig.models.map((m, idx) => {
+            const isLiveAvailable = m.available !== false;
+            return (
+              <div
+                key={m.id}
+                className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 text-xs"
+              >
+                <div className="space-y-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-bold text-slate-900 dark:text-white">
+                      {m.label}
+                    </span>
+                    <span className="font-mono text-slate-400">({m.id})</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
+                        m.provider === 'openai'
+                          ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
+                          : 'bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300'
+                      }`}
+                    >
+                      {m.provider}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 font-mono text-[10px] uppercase text-slate-600 dark:text-slate-300">
+                      {m.tier || m.category}
+                    </span>
+                    <span
+                      className={`font-mono text-[10.5px] font-semibold ${
+                        isLiveAvailable
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-amber-600 dark:text-amber-400'
+                      }`}
+                    >
+                      {isLiveAvailable ? '● Live Ready' : '○ Key / Tier Locked'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500">
+                    {m.description}
+                    {m.availabilityNote ? ` — ${m.availabilityNote}` : ''}
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                  <label className="flex items-center gap-1">
+                    <span className="text-slate-500">Base cr:</span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={m.baseCreditCost}
+                      onChange={(e) => {
+                        const next = [...draftConfig.models];
+                        next[idx] = {
+                          ...m,
+                          baseCreditCost: Number(e.target.value),
+                        };
+                        setDraftConfig({ ...draftConfig, models: next });
+                      }}
+                      className="w-14 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono"
+                    />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    <span className="text-slate-500">Cr/1K:</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={m.creditsPer1kTokens}
+                      onChange={(e) => {
+                        const next = [...draftConfig.models];
+                        next[idx] = {
+                          ...m,
+                          creditsPer1kTokens: Number(e.target.value),
+                        };
+                        setDraftConfig({ ...draftConfig, models: next });
+                      }}
+                      className="w-14 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono"
+                    />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    <span className="text-slate-500">In $/1M:</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min={0}
+                      value={m.inputUsdPer1M}
+                      onChange={(e) => {
+                        const next = [...draftConfig.models];
+                        next[idx] = {
+                          ...m,
+                          inputUsdPer1M: Number(e.target.value),
+                        };
+                        setDraftConfig({ ...draftConfig, models: next });
+                      }}
+                      className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono"
+                    />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    <span className="text-slate-500">Out $/1M:</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min={0}
+                      value={m.outputUsdPer1M}
+                      onChange={(e) => {
+                        const next = [...draftConfig.models];
+                        next[idx] = {
+                          ...m,
+                          outputUsdPer1M: Number(e.target.value),
+                        };
+                        setDraftConfig({ ...draftConfig, models: next });
+                      }}
+                      className="w-16 px-2 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = [...draftConfig.models];
+                      next[idx] = { ...m, enabled: !m.enabled };
+                      setDraftConfig({ ...draftConfig, models: next });
+                    }}
+                    className={`px-3 py-1.5 rounded-lg font-semibold cursor-pointer ${
+                      m.enabled
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {m.enabled ? 'Enabled' : 'Disabled'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
 
         <div className="flex justify-end items-center gap-3 pt-2">
           {configSaved && (

@@ -123,7 +123,7 @@ export function AdminPortalLayout({
     { id: 'admin-payments', label: 'Payments', Icon: CreditCard },
     { id: 'admin-pricing', label: 'Plans', Icon: Crown },
     { id: 'admin-api-usage', label: 'API Usage', Icon: BarChart3 },
-    { id: 'admin-openai-billing', label: 'OpenAI Billing', Icon: Database },
+    { id: 'admin-openai-billing', label: 'Provider Billing', Icon: Database },
     { id: 'admin-chat-logs', label: 'Chat Logs', Icon: MessageSquare },
     { id: 'admin-image-logs', label: 'Image Logs', Icon: ImageIcon },
     { id: 'admin-pdf-logs', label: 'PDF Logs', Icon: FileText },
@@ -131,7 +131,13 @@ export function AdminPortalLayout({
     { id: 'admin-models', label: 'Settings', Icon: Settings },
   ];
 
-  const enabledModels = workspace.config.models.filter((m) => m.enabled);
+  const availableModels = workspace.config.models.filter(
+    (m) => m.enabled && m.available !== false
+  );
+  const enabledModels =
+    availableModels.length > 0
+      ? availableModels
+      : workspace.config.models.filter((m) => m.enabled);
   const activeModel =
     enabledModels.find((m) => m.id === selectedModelId) ||
     enabledModels[0] ||
@@ -298,7 +304,7 @@ export function AdminPortalLayout({
               </button>
 
               {modelOpen && (
-                <div className="absolute left-0 mt-2 w-72 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-lg p-1.5 z-50">
+                <div className="absolute left-0 mt-2 w-80 max-h-96 overflow-y-auto rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-lg p-1.5 z-50">
                   {enabledModels.map((m) => (
                     <button
                       key={m.id}
@@ -313,8 +319,9 @@ export function AdminPortalLayout({
                         <div className="font-semibold text-slate-900 dark:text-white">
                           {m.label}
                         </div>
-                        <div className="text-[11px] text-slate-500">
-                          Base {m.baseCreditCost} cr · ${m.inputUsdPer1M}/1M in
+                        <div className="text-[11px] font-mono text-slate-500 tabular-nums">
+                          {m.provider === 'openai' ? 'OpenAI' : 'Gemini'} · Base{' '}
+                          {m.baseCreditCost} cr · ${m.inputUsdPer1M}/1M in
                         </div>
                       </div>
                       {m.id === activeModel?.id && (

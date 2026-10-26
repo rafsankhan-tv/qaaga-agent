@@ -99,12 +99,21 @@ export interface PaymentRequestDTO {
   createdAt: string;
 }
 
+export type ModelTier =
+  | 'openai-reasoning'
+  | 'openai-standard'
+  | 'openai-economical'
+  | 'gemini';
+
 export interface ModelConfigItem {
   id: string;
   label: string;
-  provider: 'openai' | 'bridge';
+  provider: 'openai' | 'gemini' | 'bridge';
+  tier?: ModelTier;
   category: 'chat' | 'reasoning' | 'image' | 'audio';
   enabled: boolean;
+  available?: boolean;
+  availabilityNote?: string;
   inputUsdPer1M: number;
   outputUsdPer1M: number;
   baseCreditCost: number;
@@ -127,6 +136,7 @@ export interface PlatformConfigDTO {
     webSearch: number;
     voiceStt: number;
     voiceTts: number;
+    voiceRealtime?: number;
   };
   toolsEnabled: {
     imageGeneration: boolean;
@@ -137,6 +147,7 @@ export interface PlatformConfigDTO {
   };
   openaiWallet: {
     purchasedUsd: number;
+    dailySpendLimitUsd?: number;
     monthlySpendLimitUsd: number;
     alertThresholdPct: number;
     walletVerificationMode: 'admin-reconciled-estimate';
@@ -144,18 +155,70 @@ export interface PlatformConfigDTO {
   models: ModelConfigItem[];
 }
 
+export interface OpenAIAccountDiscoveryDTO {
+  checkedAt: string;
+  keyPresent: boolean;
+  reachable: boolean;
+  status: number | null;
+  errorCode: string | null;
+  message: string;
+  totalModelsCount: number;
+  categorizedModels: {
+    reasoning: string[];
+    standard: string[];
+    economical: string[];
+    image: string[];
+    audio: string[];
+    realtime: string[];
+    search: string[];
+  };
+}
+
+export interface ProviderDiagnosticsDTO {
+  openai: {
+    ok: boolean;
+    keyPresent: boolean;
+    status: number | null;
+    errorCode: string | null;
+    message: string;
+    latencyMs: number;
+    availableTargetModels: string[];
+    categorizedModels: OpenAIAccountDiscoveryDTO['categorizedModels'];
+    apiNote: string;
+  };
+  gemini: {
+    ok: boolean;
+    keyPresent: boolean;
+    status: number | null;
+    errorCode: string | null;
+    message: string;
+    latencyMs: number;
+    availableModels: string[];
+  };
+}
+
 export interface ProviderCapabilitiesDTO {
   openaiConfigured: boolean;
+  openaiLiveVerified?: boolean;
+  geminiConfigured?: boolean;
   geminiBridgeConfigured: boolean;
-  activeMode: 'openai-live' | 'sandbox-bridge' | 'demo-simulation';
+  activeMode:
+    | 'multi-provider-live'
+    | 'openai-live'
+    | 'gemini-live'
+    | 'sandbox-bridge'
+    | 'demo-simulation';
+  openaiDiscovery?: OpenAIAccountDiscoveryDTO;
   features: {
     chatStreaming: { available: boolean; provider: string; note: string };
+    reasoning?: { available: boolean; provider: string; note: string };
     imageGeneration: { available: boolean; provider: string; note: string };
     imageAnalysis: { available: boolean; provider: string; note: string };
     pdfAnalysis: { available: boolean; provider: string; note: string };
     webSearch: { available: boolean; provider: string; note: string };
     speechToText: { available: boolean; provider: string; note: string };
     textToSpeech: { available: boolean; provider: string; note: string };
+    realtimeVoice?: { available: boolean; provider: string; note: string };
   };
 }
 
@@ -231,6 +294,18 @@ export interface AdminActivityLogItem {
   createdAt: string;
 }
 
+export interface ProviderErrorLogDTO {
+  id: number;
+  provider: string;
+  model: string;
+  feature: string;
+  status: number | null;
+  errorCode: string;
+  message: string;
+  userEmail: string;
+  createdAt: string;
+}
+
 export interface AdminDashboardDTO {
   kpis: {
     totalUsers: number;
@@ -244,7 +319,13 @@ export interface AdminDashboardDTO {
     approvedPaymentsCount: number;
     openaiPurchasedUsd: number;
     openaiUsedUsd: number;
+    openaiTodayUsd: number;
+    geminiUsedUsd: number;
+    geminiTodayUsd: number;
+    totalProviderUsedUsd: number;
+    todayProviderUsedUsd: number;
     openaiRemainingEstimatedUsd: number;
+    dailySpendLimitUsd: number;
     monthlySpendLimitUsd: number;
     totalTokensUsed: number;
     walletSourceLabel: string;
@@ -258,6 +339,8 @@ export interface AdminDashboardDTO {
     date: string;
     credits: number;
     usdCost: number;
+    openaiUsdCost?: number;
+    geminiUsdCost?: number;
     tokens: number;
     requests: number;
   }>;
@@ -280,6 +363,8 @@ export interface AdminDashboardDTO {
     fullName: string;
     email: string;
     usdCost: number;
+    openaiUsdCost: number;
+    geminiUsdCost: number;
     requests: number;
     tokens: number;
     creditsCharged: number;
@@ -293,6 +378,7 @@ export interface AdminDashboardDTO {
     subscriptionExpiresAt: string | null;
     isExpired: boolean;
     dailyCreditLimit: number;
+    usedTodayCredits: number;
     latestPlanBdt: number | null;
     creditsAssigned: number;
     creditsUsed: number;
@@ -302,10 +388,16 @@ export interface AdminDashboardDTO {
     pdfCredits: number;
     searchCredits: number;
     voiceCredits: number;
+    openaiUsdCost: number;
+    geminiUsdCost: number;
+    totalUsdCost: number;
+    totalTokens: number;
+    apiRequests: number;
     createdAt: string;
   }>;
   payments: PaymentRequestDTO[];
   activityLogs: AdminActivityLogItem[];
+  providerErrors: ProviderErrorLogDTO[];
   announcements: Array<{
     id: number;
     title: string;

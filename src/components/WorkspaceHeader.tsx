@@ -67,13 +67,59 @@ export function WorkspaceHeader({
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const enabledModels: ModelConfigItem[] = workspace.config.models.filter(
-    (m) => m.enabled
+  // Show only supported, enabled, and live-available models to end users
+  const availableModels: ModelConfigItem[] = workspace.config.models.filter(
+    (m) => m.enabled && m.available !== false
   );
+  const selectableModels =
+    availableModels.length > 0
+      ? availableModels
+      : workspace.config.models.filter((m) => m.enabled);
+
   const activeModel =
-    enabledModels.find((m) => m.id === selectedModelId) ||
-    enabledModels[0] ||
+    selectableModels.find((m) => m.id === selectedModelId) ||
+    selectableModels[0] ||
     workspace.config.models[0];
+
+  const tierGroups: Array<{
+    tier: NonNullable<ModelConfigItem['tier']>;
+    title: string;
+    items: ModelConfigItem[];
+  }> = [
+    {
+      tier: 'openai-reasoning' as const,
+      title: 'OpenAI · Advanced Reasoning',
+      items: selectableModels.filter((m) => m.tier === 'openai-reasoning'),
+    },
+    {
+      tier: 'openai-standard' as const,
+      title: 'OpenAI · Standard Models',
+      items: selectableModels.filter(
+        (m) =>
+          m.tier === 'openai-standard' ||
+          (!m.tier && m.provider === 'openai' && !m.id.includes('mini'))
+      ),
+    },
+    {
+      tier: 'openai-economical' as const,
+      title: 'OpenAI · Economical Models',
+      items: selectableModels.filter(
+        (m) =>
+          m.tier === 'openai-economical' ||
+          (!m.tier && m.provider === 'openai' && m.id.includes('mini'))
+      ),
+    },
+    {
+      tier: 'gemini' as const,
+      title: 'Google Gemini Models',
+      items: selectableModels.filter(
+        (m) =>
+          m.tier === 'gemini' ||
+          m.provider === 'gemini' ||
+          m.provider === 'bridge'
+      ),
+    },
+  ].filter((g) => g.items.length > 0);
 
   const unreadCount = workspace.notifications.filter((n) => !n.isRead).length;
   const caps: ProviderCapabilitiesDTO = workspace.capabilities;
@@ -97,53 +143,70 @@ export function WorkspaceHeader({
             onClick={() => setModelOpen((o) => !o)}
             className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800/90 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-[13px] font-semibold text-slate-900 dark:text-slate-100 cursor-pointer whitespace-nowrap"
           >
-            <span className="truncate max-w-[180px]">
-              {activeModel?.label || 'GPT-4o'}
+            <span className="truncate max-w-[190px]">
+              {activeModel?.label || 'Gemini 3.8 Flash'}
             </span>
-            <span className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
-              · Recommended
+            <span className="text-[11px] font-mono font-medium text-emerald-700 dark:text-emerald-400">
+              · {activeModel?.baseCreditCost ?? 2} cr
             </span>
             <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
           </button>
 
           {modelOpen && (
-            <div className="absolute left-0 mt-2 w-80 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-lg p-1.5 z-50">
-              <div className="px-3 py-1.5 text-[11px] font-medium text-slate-400 flex items-center justify-between">
-                <span>Available Models</span>
-                <span>
-                  {caps.openaiConfigured ? 'OpenAI Live' : 'Sandbox Bridge'}
+            <div className="absolute left-0 mt-2 w-88 max-h-[420px] overflow-y-auto rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-lg p-2 z-50">
+              <div className="px-3 py-1.5 border-b border-slate-100 dark:border-slate-800 text-[11px] font-medium text-slate-500 dark:text-slate-400 flex items-center justify-between">
+                <span>Supported & Available Models</span>
+                <span className="font-mono text-emerald-700 dark:text-emerald-400">
+                  {caps.openaiLiveVerified && caps.geminiConfigured
+                    ? 'OpenAI + Gemini Live'
+                    : caps.openaiLiveVerified
+                    ? 'OpenAI Live'
+                    : 'Gemini Live'}
                 </span>
               </div>
-              {enabledModels.map((m) => {
-                const selected = m.id === activeModel?.id;
-                return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => {
-                      onSelectModel(m.id);
-                      setModelOpen(false);
-                    }}
-                    className={`w-full text-left px-3 py-2.5 rounded-xl flex items-start justify-between gap-2 transition-colors cursor-pointer ${
-                      selected
-                        ? 'bg-emerald-50 dark:bg-emerald-950/40'
-                        : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
-                    }`}
-                  >
-                    <div>
-                      <div className="text-[13px] font-semibold text-slate-900 dark:text-slate-100">
-                        {m.label}
-                      </div>
-                      <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                        {m.description} · Base {m.baseCreditCost} cr
-                      </p>
+
+              <div className="divide-y divide-slate-100 dark:divide-slate-800/80">
+                {tierGroups.map((group) => (
+                  <div key={group.tier} className="py-1.5">
+                    <div className="px-3 py-1 text-[10.5px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                      {group.title}
                     </div>
-                    {selected && (
-                      <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                    )}
-                  </button>
-                );
-              })}
+                    {group.items.map((m) => {
+                      const selected = m.id === activeModel?.id;
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => {
+                            onSelectModel(m.id);
+                            setModelOpen(false);
+                          }}
+                          className={`w-full text-left px-3 py-2 rounded-xl flex items-start justify-between gap-2 transition-colors cursor-pointer ${
+                            selected
+                              ? 'bg-emerald-50 dark:bg-emerald-950/40'
+                              : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-[13px] font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                              <span className="truncate">{m.label}</span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-snug">
+                              {m.description}
+                            </p>
+                            <p className="text-[10.5px] font-mono text-emerald-700 dark:text-emerald-400 mt-0.5 tabular-nums">
+                              Base {m.baseCreditCost} cr · +{m.creditsPer1kTokens ?? 1} cr/1K tok
+                            </p>
+                          </div>
+                          {selected && (
+                            <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

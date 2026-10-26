@@ -48,6 +48,7 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
     webSearch: 6,
     voiceStt: 4,
     voiceTts: 4,
+    voiceRealtime: 12,
   },
   toolsEnabled: {
     imageGeneration: true,
@@ -58,6 +59,7 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
   },
   openaiWallet: {
     purchasedUsd: 120,
+    dailySpendLimitUsd: 15,
     monthlySpendLimitUsd: 100,
     alertThresholdPct: 80,
     walletVerificationMode: 'admin-reconciled-estimate',
@@ -65,10 +67,12 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
   models: [
     {
       id: 'gpt-4o',
-      label: 'GPT-5',
+      label: 'GPT-4o (Flagship)',
       provider: 'openai',
       category: 'chat',
+      tier: 'openai-standard',
       enabled: true,
+      available: true,
       inputUsdPer1M: 2.5,
       outputUsdPer1M: 10.0,
       baseCreditCost: 2,
@@ -76,16 +80,32 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
       description: 'Flagship multimodal reasoning & coding assistant.',
     },
     {
-      id: 'gpt-4o-mini',
-      label: 'GPT-4o mini',
-      provider: 'openai',
+      id: 'gemini-3.8-flash',
+      label: 'Gemini 3.8 Flash',
+      provider: 'gemini',
       category: 'chat',
+      tier: 'gemini',
       enabled: true,
-      inputUsdPer1M: 0.15,
-      outputUsdPer1M: 0.6,
+      available: true,
+      inputUsdPer1M: 0.3,
+      outputUsdPer1M: 2.5,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'High-speed multimodal reasoning, PDF & grounded search.',
+    },
+    {
+      id: 'gemini-3.1-flash-lite',
+      label: 'Gemini 3.1 Flash-Lite',
+      provider: 'gemini',
+      category: 'chat',
+      tier: 'gemini',
+      enabled: true,
+      available: true,
+      inputUsdPer1M: 0.075,
+      outputUsdPer1M: 0.3,
       baseCreditCost: 1,
       creditsPer1kTokens: 1,
-      description: 'Fast everyday responses with minimal credit cost.',
+      description: 'Economical low-latency assistant.',
     },
   ],
 };
@@ -99,16 +119,20 @@ const FALLBACK_PACKAGES: RechargePackageDTO[] = [
 
 const FALLBACK_CAPABILITIES: ProviderCapabilitiesDTO = {
   openaiConfigured: false,
+  openaiLiveVerified: false,
+  geminiConfigured: true,
   geminiBridgeConfigured: true,
-  activeMode: 'sandbox-bridge',
+  activeMode: 'gemini-live',
   features: {
-    chatStreaming: { available: true, provider: 'QAAGA Engine', note: 'Streaming ready' },
-    imageGeneration: { available: true, provider: 'QAAGA Engine', note: 'Image studio ready' },
-    imageAnalysis: { available: true, provider: 'QAAGA Engine', note: 'Vision analysis ready' },
-    pdfAnalysis: { available: true, provider: 'QAAGA Engine', note: 'PDF analysis ready' },
-    webSearch: { available: true, provider: 'QAAGA Engine', note: 'Web grounding ready' },
-    speechToText: { available: true, provider: 'QAAGA Engine', note: 'Speech recognition ready' },
-    textToSpeech: { available: true, provider: 'QAAGA Engine', note: 'Neural speech ready' },
+    chatStreaming: { available: true, provider: 'Google Gemini API', note: 'Streaming ready' },
+    reasoning: { available: true, provider: 'Google Gemini API', note: 'Thinking mode ready' },
+    imageGeneration: { available: false, provider: 'OpenAI DALL-E 3', note: 'Requires live OpenAI API key' },
+    imageAnalysis: { available: true, provider: 'Google Gemini Vision', note: 'Vision analysis ready' },
+    pdfAnalysis: { available: true, provider: 'Google Gemini Multimodal', note: 'PDF analysis ready' },
+    webSearch: { available: true, provider: 'Google Search Grounding', note: 'Web grounding ready' },
+    speechToText: { available: true, provider: 'Gemini 3.5 Transcribe', note: 'Speech recognition ready' },
+    textToSpeech: { available: true, provider: 'Gemini 3.8 TTS', note: 'Neural speech ready' },
+    realtimeVoice: { available: true, provider: 'Gemini 3.8 Live Audio', note: 'Duplex voice ready' },
   },
 };
 
@@ -179,6 +203,9 @@ function QaagaAppShell() {
   // Active Chat State
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string>('gpt-4o');
+  const [reasoningEffort, setReasoningEffort] = useState<
+    'low' | 'medium' | 'high'
+  >('medium');
   const [chatInput, setChatInput] = useState('');
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [uploads, setUploads] = useState<LocalUploadFile[]>([]);
@@ -204,6 +231,14 @@ function QaagaAppShell() {
             packages: data.packages,
             capabilities: data.capabilities || FALLBACK_CAPABILITIES,
           });
+          const liveModels = (
+            data.config as PlatformConfigDTO
+          ).models.filter((m) => m.enabled && m.available !== false);
+          if (liveModels.length > 0) {
+            setSelectedModelId((prev) =>
+              liveModels.some((m) => m.id === prev) ? prev : liveModels[0].id
+            );
+          }
         }
       })
       .catch(() => {
@@ -272,12 +307,18 @@ function QaagaAppShell() {
       setWorkspace(payload);
       setUser(payload.user);
       setSelectedModelId((prev) => {
-        const enabled = payload.config.models.filter((m) => m.enabled);
-        if (enabled.some((m) => m.id === prev)) return prev;
-        if (enabled.some((m) => m.id === payload.user.preferredModel)) {
+        const liveEnabled = payload.config.models.filter(
+          (m) => m.enabled && m.available !== false
+        );
+        const candidates =
+          liveEnabled.length > 0
+            ? liveEnabled
+            : payload.config.models.filter((m) => m.enabled);
+        if (candidates.some((m) => m.id === prev)) return prev;
+        if (candidates.some((m) => m.id === payload.user.preferredModel)) {
           return payload.user.preferredModel;
         }
-        return enabled[0]?.id || 'gpt-4o';
+        return candidates[0]?.id || 'gemini-3.8-flash';
       });
 
       if (payload.user.role === 'admin' && payload.user.status === 'ACTIVE') {
@@ -498,6 +539,7 @@ function QaagaAppShell() {
         body: JSON.stringify({
           prompt: promptToSend.trim(),
           modelId: selectedModelId,
+          reasoningEffort,
           webSearch: false,
           attachments: [],
           history: historySnapshot.slice(-10).map((m) => ({
@@ -795,6 +837,7 @@ function QaagaAppShell() {
           sessionId: activeSessionId,
           prompt: promptToSend,
           modelId: selectedModelId,
+          reasoningEffort,
           webSearch: useSearch,
           regenerateLast: Boolean(opts?.regenerateLast),
           attachments: attachmentsToSend.map((a) => ({
@@ -883,6 +926,15 @@ function QaagaAppShell() {
     }
   };
 
+  const activeModelObj = effectiveWorkspace.config.models.find(
+    (m) => m.id === selectedModelId
+  );
+  const preferredAudioProvider: 'openai' | 'gemini' =
+    activeModelObj?.provider === 'openai' &&
+    effectiveWorkspace.capabilities.openaiLiveVerified
+      ? 'openai'
+      : 'gemini';
+
   const handleTranscribeBlob = async (
     base64Audio: string,
     mimeType: string
@@ -893,7 +945,11 @@ function QaagaAppShell() {
     }
     const res = await authFetch('/api/voice/transcribe', {
       method: 'POST',
-      body: JSON.stringify({ base64Audio, mimeType }),
+      body: JSON.stringify({
+        base64Audio,
+        mimeType,
+        provider: preferredAudioProvider,
+      }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -926,6 +982,7 @@ function QaagaAppShell() {
         body: JSON.stringify({
           text: text.slice(0, 1500),
           voice: effectiveWorkspace.user.preferredVoice,
+          provider: preferredAudioProvider,
         }),
       });
       const data = await res.json();
@@ -1151,6 +1208,18 @@ function QaagaAppShell() {
             await fetchWorkspace();
             await fetchAdminDashboard();
           }}
+          onTestOpenAI={async () => {
+            const res = await authFetch('/api/admin/openai/test', {
+              method: 'POST',
+            });
+            return await res.json();
+          }}
+          onTestProviders={async () => {
+            const res = await authFetch('/api/admin/providers/test', {
+              method: 'POST',
+            });
+            return await res.json();
+          }}
         />
       </AdminPortalLayout>
     );
@@ -1203,6 +1272,9 @@ function QaagaAppShell() {
               workspace={effectiveWorkspace}
               isGuest={isGuest}
               activeSession={activeSession}
+              selectedModelId={selectedModelId}
+              reasoningEffort={reasoningEffort}
+              onChangeReasoningEffort={setReasoningEffort}
               streamingText={streamingText}
               isStreaming={isStreaming}
               streamError={streamError}
@@ -1301,8 +1373,12 @@ function QaagaAppShell() {
           {!isGuest && activeNav === 'voice-studio' && (
             <VoiceConversationPanel
               workspace={effectiveWorkspace}
+              authToken={token}
               onTranscribe={handleTranscribeBlob}
               onRequireRecharge={openRechargeModal}
+              onRefreshWorkspace={async () => {
+                await fetchWorkspace();
+              }}
               onVoiceTurn={async (spokenPrompt) => {
                 setActiveSessionId(null);
                 setActiveNav('chat');

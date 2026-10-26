@@ -1,8 +1,10 @@
 import crypto from 'crypto';
+import http from 'http';
 import dotenv from 'dotenv';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { WebSocket, WebSocketServer } from 'ws';
 import { and, asc, desc, eq } from 'drizzle-orm';
 import { db } from './src/db/index.ts';
 import {
@@ -22,8 +24,10 @@ import {
   ensureSeeded,
   finalizeCreditReservation,
   getActivePackages,
+  getOrCreateGoogleUser,
   getPlatformConfig,
   mapUserRowToDTO,
+  recordProviderApiError,
   reserveCreditsForUsage,
   reviewPaymentRequestAtomic,
   savePlatformConfig,
@@ -32,19 +36,27 @@ import {
   createRateLimiter,
   hashPassword,
   signLocalJwt,
+  verifyLocalJwt,
   verifyPassword,
 } from './src/lib/cryptoAuth.ts';
+import { adminAuth } from './src/lib/firebase-admin.ts';
 import { requireAdmin, requireAuth } from './src/middleware/auth.ts';
 import type { AuthRequest } from './src/middleware/auth.ts';
 import {
   calculateInternalCreditCharge,
+  connectGeminiLiveVoiceSession,
+  enrichConfigWithLiveAvailability,
+  extractProviderErrorMeta,
   generateImageAsset,
-  getProviderCapabilities,
+  getOpenAIRealtimeAuthHeaders,
   streamChatCompletion,
   synthesizeSpeechAudio,
+  testAllProvidersConnection,
+  testOpenAIConnection,
   transcribeAudioBuffer,
 } from './src/services/aiProvider.ts';
 import type {
+  AuthUser,
   ChatMessageDTO,
   ChatSessionDTO,
   PaymentMethodType,
@@ -87,11 +99,43 @@ async function startServer() {
     res.status(400).json({ error: raw });
   };
 
+  const enforcePlatformSpendCaps = async (config: PlatformConfigDTO) => {
+    const providerLogs = await db.select().from(providerUsageLogs);
+    const now = new Date();
+    const todayStart = new Date(now);
+    todayStart.setHours(0, 0, 0, 0);
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    let todaySpendUsd = 0;
+    let monthSpendUsd = 0;
+
+    for (const r of providerLogs) {
+      const usd = Number(r.providerCostUsd) || 0;
+      const ts = new Date(r.createdAt);
+      if (ts >= todayStart) todaySpendUsd += usd;
+      if (ts >= monthStart) monthSpendUsd += usd;
+    }
+
+    const dailyCap = config.openaiWallet.dailySpendLimitUsd ?? 15.0;
+    const monthlyCap = config.openaiWallet.monthlySpendLimitUsd ?? 50.0;
+
+    if (dailyCap > 0 && todaySpendUsd >= dailyCap) {
+      throw new Error(
+        `Platform daily API spending cap ($${dailyCap.toFixed(2)}/day) reached. Administrator review required.`
+      );
+    }
+    if (monthlyCap > 0 && monthSpendUsd >= monthlyCap) {
+      throw new Error(
+        `Platform monthly API spending cap ($${monthlyCap.toFixed(2)}/month) reached. Administrator review required.`
+      );
+    }
+  };
+
   // Public Health & Provider Transparency Endpoint
   app.get('/api/public/status', async (_req, res) => {
     try {
-      const config = await getPlatformConfig();
-      const capabilities = getProviderCapabilities(config);
+      const rawConfig = await getPlatformConfig();
+      const { capabilities } = await enrichConfigWithLiveAvailability(rawConfig);
       res.json({ capabilities });
     } catch (error: unknown) {
       res.status(500).json({
@@ -104,10 +148,11 @@ async function startServer() {
   app.get('/api/public/frontpage', async (_req, res) => {
     try {
       await ensureSeeded();
-      const config = await getPlatformConfig();
+      const rawConfig = await getPlatformConfig();
+      const { enrichedConfig, capabilities } =
+        await enrichConfigWithLiveAvailability(rawConfig);
       const packages = await getActivePackages();
-      const capabilities = getProviderCapabilities(config);
-      res.json({ config, packages, capabilities });
+      res.json({ config: enrichedConfig, packages, capabilities });
     } catch (error: unknown) {
       res.status(500).json({
         error:
@@ -122,8 +167,14 @@ async function startServer() {
   app.post('/api/public/chat/stream', guestChatLimiter, async (req, res) => {
     try {
       await ensureSeeded();
-      const { prompt, modelId, history, webSearch, attachments } =
-        req.body || {};
+      const {
+        prompt,
+        modelId,
+        history,
+        webSearch,
+        attachments,
+        reasoningEffort,
+      } = req.body || {};
       const cleanPrompt = String(prompt || '').trim();
 
       if (!cleanPrompt) {
@@ -150,23 +201,28 @@ async function startServer() {
         return;
       }
 
-      const config = await getPlatformConfig();
-      const providerLogs = await db.select().from(providerUsageLogs);
-      const currentUsdSpend = providerLogs.reduce(
-        (acc, r) => acc + (Number(r.providerCostUsd) || 0),
-        0
-      );
-      if (currentUsdSpend >= config.openaiWallet.monthlySpendLimitUsd) {
+      const rawConfig = await getPlatformConfig();
+      try {
+        await enforcePlatformSpendCaps(rawConfig);
+      } catch (capErr: unknown) {
         res.status(403).json({
-          error: 'Platform monthly API spending limit reached.',
+          error:
+            capErr instanceof Error
+              ? capErr.message
+              : 'Platform API spending limit reached.',
         });
         return;
       }
 
+      const { enrichedConfig } = await enrichConfigWithLiveAvailability(rawConfig);
+
       const chosenModel =
-        config.models.find((m) => m.id === modelId && m.enabled) ||
-        config.models.find((m) => m.enabled) ||
-        config.models[0];
+        enrichedConfig.models.find(
+          (m) => m.id === modelId && m.enabled && m.available !== false
+        ) ||
+        enrichedConfig.models.find((m) => m.enabled && m.available !== false) ||
+        enrichedConfig.models.find((m) => m.enabled) ||
+        enrichedConfig.models[0];
 
       const safeHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
         Array.isArray(history)
@@ -197,6 +253,9 @@ async function startServer() {
           history: safeHistory,
           prompt: cleanPrompt,
           webSearch: false,
+          reasoningEffort: ['low', 'medium', 'high'].includes(reasoningEffort)
+            ? reasoningEffort
+            : 'medium',
           userFullName: 'Guest Visitor',
           onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
         });
@@ -207,6 +266,20 @@ async function startServer() {
         });
         res.end();
       } catch (streamErr: unknown) {
+        const errMeta = extractProviderErrorMeta(streamErr);
+        await recordProviderApiError({
+          actorUserId: null,
+          actorEmail: 'guest@qaaga.ai',
+          provider:
+            chosenModel.provider === 'gemini' || chosenModel.provider === 'bridge'
+              ? 'gemini'
+              : 'openai',
+          model: chosenModel.id,
+          feature: 'guest_chat',
+          status: errMeta.status,
+          errorCode: errMeta.errorCode,
+          safeMessage: errMeta.safeMessage,
+        });
         sendSSE({
           type: 'error',
           error:
@@ -380,8 +453,9 @@ async function startServer() {
   app.get('/api/workspace', requireAuth, async (req: AuthRequest, res) => {
     try {
       const authUser = req.authUser!;
-      const config = await getPlatformConfig();
-      const capabilities = getProviderCapabilities(config);
+      const rawConfig = await getPlatformConfig();
+      const { enrichedConfig: config, capabilities } =
+        await enrichConfigWithLiveAvailability(rawConfig);
       const packages = await getActivePackages();
       const { summary: credits, recentLedger: ledger } =
         await computeUserCredits(authUser.id, authUser.dailyCreditLimit);
@@ -752,6 +826,7 @@ async function startServer() {
         prompt,
         modelId,
         webSearch,
+        reasoningEffort,
         attachments,
         regenerateLast,
       }: {
@@ -759,6 +834,7 @@ async function startServer() {
         prompt?: string;
         modelId?: string;
         webSearch?: boolean;
+        reasoningEffort?: 'low' | 'medium' | 'high';
         regenerateLast?: boolean;
         attachments?: Array<{
           name: string;
@@ -770,24 +846,26 @@ async function startServer() {
       } = req.body || {};
 
       try {
-        const config = await getPlatformConfig();
-
-        // Check monthly OpenAI spend guard
-        const providerLogs = await db.select().from(providerUsageLogs);
-        const currentUsdSpend = providerLogs.reduce(
-          (acc, r) => acc + (Number(r.providerCostUsd) || 0),
-          0
-        );
-        if (currentUsdSpend >= config.openaiWallet.monthlySpendLimitUsd) {
+        const rawConfig = await getPlatformConfig();
+        try {
+          await enforcePlatformSpendCaps(rawConfig);
+        } catch (capErr: unknown) {
           res.status(403).json({
             error:
-              'Platform monthly API spending limit reached. Administrator review required.',
+              capErr instanceof Error
+                ? capErr.message
+                : 'Platform API spending limit reached.',
           });
           return;
         }
 
+        const { enrichedConfig: config } =
+          await enrichConfigWithLiveAvailability(rawConfig);
+
+        // Honor explicit modelId if enabled (allows direct provider calls & testing), otherwise default to first available enabled model
         const chosenModel =
           config.models.find((m) => m.id === modelId && m.enabled) ||
+          config.models.find((m) => m.enabled && m.available !== false) ||
           config.models.find((m) => m.enabled) ||
           config.models[0];
 
@@ -839,9 +917,12 @@ async function startServer() {
             ? config.creditRates.imageAnalysis
             : featureCategory === 'search'
             ? config.creditRates.webSearch
-            : chosenModel.baseCreditCost;
+            : chosenModel.baseCreditCost || config.creditRates.chatBase;
 
-        // Reserve base + buffer (refunded upon settlement if unused)
+        const per1kTokenRate =
+          chosenModel.creditsPer1kTokens ?? config.creditRates.chatPer1kTokens;
+
+        // Reserve base + buffer (refunded upon settlement if unused, or 100% refunded on failure)
         const reserveAmount = baseReserve + 2;
         const reservation = await reserveCreditsForUsage({
           userId: authUser.id,
@@ -945,6 +1026,11 @@ async function startServer() {
             history: historyForModel,
             prompt: effectivePrompt,
             webSearch: Boolean(webSearch),
+            reasoningEffort:
+              reasoningEffort &&
+              ['low', 'medium', 'high'].includes(reasoningEffort)
+                ? reasoningEffort
+                : 'medium',
             attachments: attachments?.map((a) => ({
               name: a.name,
               mimeType: a.mimeType,
@@ -956,7 +1042,7 @@ async function startServer() {
 
           const actualCredits = calculateInternalCreditCharge(
             baseReserve,
-            chosenModel.creditsPer1kTokens,
+            per1kTokenRate,
             result.totalTokens
           );
 
@@ -966,14 +1052,14 @@ async function startServer() {
             reservedAmount: reserveAmount,
             actualAmount: actualCredits,
             feature: featureCategory,
-            description: `${chosenModel.id} · ${result.totalTokens} tokens`,
+            description: `${result.modelUsed} · ${result.totalTokens} tokens`,
           });
 
           // Log Provider Token & USD Spend independently from User Internal Credits
           await db.insert(providerUsageLogs).values({
             userId: authUser.id,
             provider: result.providerUsed,
-            model: chosenModel.id,
+            model: result.modelUsed,
             feature: featureCategory,
             promptTokens: result.promptTokens,
             completionTokens: result.completionTokens,
@@ -1012,6 +1098,8 @@ async function startServer() {
             messageId: savedAssistant.id,
             creditsCharged: actualCredits,
             tokensUsed: result.totalTokens,
+            providerUsed: result.providerUsed,
+            modelUsed: result.modelUsed,
             citations: result.citations,
           });
           res.end();
@@ -1024,6 +1112,21 @@ async function startServer() {
             actualAmount: 0,
             feature: featureCategory,
             description: 'Provider failure refund',
+          });
+          const errMeta = extractProviderErrorMeta(streamErr);
+          await recordProviderApiError({
+            actorUserId: authUser.id,
+            actorEmail: authUser.email,
+            provider:
+              chosenModel.provider === 'gemini' ||
+              chosenModel.provider === 'bridge'
+                ? 'gemini'
+                : 'openai',
+            model: chosenModel.id,
+            feature: featureCategory,
+            status: errMeta.status,
+            errorCode: errMeta.errorCode,
+            safeMessage: errMeta.safeMessage,
           });
           sendSSE({
             type: 'error',
@@ -1055,6 +1158,8 @@ async function startServer() {
           });
           return;
         }
+
+        await enforcePlatformSpendCaps(config);
 
         const prompt = String(req.body?.prompt || '').trim();
         const aspectRatio: '1:1' | '16:9' | '3:4' = ['1:1', '16:9', '3:4'].includes(
@@ -1091,7 +1196,7 @@ async function startServer() {
           await db.insert(providerUsageLogs).values({
             userId: authUser.id,
             provider: generated.providerUsed,
-            model: generated.providerUsed === 'openai' ? 'dall-e-3' : 'vector-bridge',
+            model: generated.modelUsed,
             feature: 'image',
             promptTokens: 0,
             completionTokens: 0,
@@ -1106,7 +1211,7 @@ async function startServer() {
             .values({
               userId: authUser.id,
               title: `Image: ${prompt.slice(0, 44)}`,
-              model: generated.providerUsed === 'openai' ? 'dall-e-3' : 'vector-studio',
+              model: generated.modelUsed,
               mode: 'image',
             })
             .returning();
@@ -1138,6 +1243,17 @@ async function startServer() {
             feature: 'image',
             description: 'Failed image generation refund',
           });
+          const errMeta = extractProviderErrorMeta(genErr);
+          await recordProviderApiError({
+            actorUserId: authUser.id,
+            actorEmail: authUser.email,
+            provider: 'openai',
+            model: 'dall-e-3',
+            feature: 'image',
+            status: errMeta.status,
+            errorCode: errMeta.errorCode,
+            safeMessage: errMeta.safeMessage,
+          });
           throw genErr;
         }
       } catch (error: unknown) {
@@ -1161,11 +1277,16 @@ async function startServer() {
           });
           return;
         }
-        const { base64Audio, mimeType } = req.body || {};
+        await enforcePlatformSpendCaps(config);
+
+        const { base64Audio, mimeType, provider } = req.body || {};
         if (!base64Audio) {
           res.status(400).json({ error: 'Audio payload missing.' });
           return;
         }
+
+        const preferredProvider: 'openai' | 'gemini' | undefined =
+          provider === 'openai' || provider === 'gemini' ? provider : undefined;
 
         const sttCredits = config.creditRates.voiceStt;
         const reservation = await reserveCreditsForUsage({
@@ -1178,7 +1299,8 @@ async function startServer() {
         try {
           const out = await transcribeAudioBuffer(
             base64Audio,
-            mimeType || 'audio/webm'
+            mimeType || 'audio/webm',
+            preferredProvider
           );
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -1192,13 +1314,17 @@ async function startServer() {
           await db.insert(providerUsageLogs).values({
             userId: authUser.id,
             provider: out.providerUsed,
-            model: out.providerUsed === 'openai' ? 'whisper-1' : 'gemini-3.5-transcribe',
+            model: out.modelUsed,
             feature: 'voice',
             internalCreditsCharged: sttCredits,
             providerCostUsd: out.providerCostUsd.toFixed(6),
           });
 
-          res.json({ transcript: out.transcript, creditsCharged: sttCredits });
+          res.json({
+            transcript: out.transcript,
+            creditsCharged: sttCredits,
+            providerUsed: out.providerUsed,
+          });
         } catch (err) {
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -1207,6 +1333,20 @@ async function startServer() {
             actualAmount: 0,
             feature: 'voice',
             description: 'Failed STT refund',
+          });
+          const errMeta = extractProviderErrorMeta(err);
+          await recordProviderApiError({
+            actorUserId: authUser.id,
+            actorEmail: authUser.email,
+            provider: preferredProvider || 'gemini',
+            model:
+              preferredProvider === 'openai'
+                ? 'gpt-4o-mini-transcribe'
+                : 'gemini-3.5-transcribe',
+            feature: 'voice_stt',
+            status: errMeta.status,
+            errorCode: errMeta.errorCode,
+            safeMessage: errMeta.safeMessage,
           });
           throw err;
         }
@@ -1231,11 +1371,16 @@ async function startServer() {
           });
           return;
         }
-        const { text, voice } = req.body || {};
+        await enforcePlatformSpendCaps(config);
+
+        const { text, voice, provider } = req.body || {};
         if (!text?.trim()) {
           res.status(400).json({ error: 'Text required for TTS.' });
           return;
         }
+
+        const preferredProvider: 'openai' | 'gemini' | undefined =
+          provider === 'openai' || provider === 'gemini' ? provider : undefined;
 
         const ttsCredits = config.creditRates.voiceTts;
         const reservation = await reserveCreditsForUsage({
@@ -1248,7 +1393,8 @@ async function startServer() {
         try {
           const out = await synthesizeSpeechAudio(
             String(text),
-            voice || authUser.preferredVoice || 'alloy'
+            voice || authUser.preferredVoice || 'alloy',
+            preferredProvider
           );
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -1262,7 +1408,7 @@ async function startServer() {
           await db.insert(providerUsageLogs).values({
             userId: authUser.id,
             provider: out.providerUsed,
-            model: out.providerUsed === 'openai' ? 'tts-1' : 'gemini-3.8-flash-lite-tts',
+            model: out.modelUsed,
             feature: 'voice',
             internalCreditsCharged: ttsCredits,
             providerCostUsd: out.providerCostUsd.toFixed(6),
@@ -1271,6 +1417,7 @@ async function startServer() {
           res.json({
             audioDataUrl: out.audioDataUrl,
             creditsCharged: ttsCredits,
+            providerUsed: out.providerUsed,
           });
         } catch (err) {
           await finalizeCreditReservation({
@@ -1280,6 +1427,20 @@ async function startServer() {
             actualAmount: 0,
             feature: 'voice',
             description: 'Failed TTS refund',
+          });
+          const errMeta = extractProviderErrorMeta(err);
+          await recordProviderApiError({
+            actorUserId: authUser.id,
+            actorEmail: authUser.email,
+            provider: preferredProvider || 'gemini',
+            model:
+              preferredProvider === 'openai'
+                ? 'tts-1'
+                : 'gemini-3.8-flash-lite-tts',
+            feature: 'voice_tts',
+            status: errMeta.status,
+            errorCode: errMeta.errorCode,
+            safeMessage: errMeta.safeMessage,
           });
           throw err;
         }
@@ -1621,7 +1782,7 @@ async function startServer() {
     }
   );
 
-  // Save Platform Settings (Receiver numbers, credit rates, OpenAI USD budget, models, tools)
+  // Save Platform Settings (Receiver numbers, credit rates, OpenAI/Gemini USD caps, models, tools)
   app.put(
     '/api/admin/config',
     requireAuth,
@@ -1633,13 +1794,58 @@ async function startServer() {
           id: req.authUser!.id,
           email: req.authUser!.email,
         });
-        res.json({ config: saved });
+        const { enrichedConfig } = await enrichConfigWithLiveAvailability(
+          saved,
+          true
+        );
+        res.json({ config: enrichedConfig });
       } catch (error: unknown) {
         res.status(500).json({
           error:
             error instanceof Error
               ? error.message
               : 'Configuration update failed.',
+        });
+      }
+    }
+  );
+
+  // Live OpenAI API Connection Diagnostic (Protected Admin Route — Never Exposes OPENAI_API_KEY)
+  app.post(
+    '/api/admin/openai/test',
+    requireAuth,
+    requireAdmin,
+    async (_req: AuthRequest, res) => {
+      try {
+        const diagnostic = await testOpenAIConnection();
+        res.json(diagnostic);
+      } catch (error: unknown) {
+        res.status(500).json({
+          ok: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'OpenAI connection diagnostic failed.',
+        });
+      }
+    }
+  );
+
+  // Live Multi-Provider (OpenAI + Google Gemini) Connectivity & Model Discovery Diagnostic
+  app.post(
+    '/api/admin/providers/test',
+    requireAuth,
+    requireAdmin,
+    async (_req: AuthRequest, res) => {
+      try {
+        const diagnostics = await testAllProvidersConnection();
+        res.json(diagnostics);
+      } catch (error: unknown) {
+        res.status(500).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Provider diagnostics failed.',
         });
       }
     }
@@ -1678,7 +1884,438 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true });
+
+  const resolveWsUser = async (token: string): Promise<AuthUser | null> => {
+    if (!token) return null;
+    try {
+      await ensureSeeded();
+      const localPayload = verifyLocalJwt(token);
+      if (localPayload) {
+        const [row] = await db
+          .select()
+          .from(users)
+          .where(eq(users.uid, localPayload.sub));
+        return row ? mapUserRowToDTO(row) : null;
+      }
+      const decoded = await adminAuth.verifyIdToken(token);
+      const synced = await getOrCreateGoogleUser(
+        decoded.uid,
+        decoded.email || `${decoded.uid}@google.user`,
+        decoded.name
+      );
+      return mapUserRowToDTO(synced);
+    } catch {
+      return null;
+    }
+  };
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    try {
+      const parsedUrl = new URL(request.url || '/', 'http://localhost');
+      if (parsedUrl.pathname !== '/api/realtime/voice') {
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request, parsedUrl);
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  wss.on(
+    'connection',
+    async (
+      clientWs: WebSocket,
+      _req: http.IncomingMessage,
+      parsedUrl: URL
+    ) => {
+      const sendClient = (payload: Record<string, unknown>) => {
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.send(JSON.stringify(payload));
+        }
+      };
+
+      const token = parsedUrl.searchParams.get('token') || '';
+      const requestedProvider =
+        parsedUrl.searchParams.get('provider') === 'openai'
+          ? 'openai'
+          : 'gemini';
+
+      const wsUser = await resolveWsUser(token);
+      if (!wsUser) {
+        sendClient({
+          type: 'error',
+          code: 'LOGIN_REQUIRED',
+          message: 'Unauthorized session. Please sign in again.',
+        });
+        clientWs.close();
+        return;
+      }
+
+      const rawConfig = await getPlatformConfig();
+      if (!rawConfig.toolsEnabled.voiceChat) {
+        sendClient({
+          type: 'error',
+          message: 'Realtime voice is disabled by administrator.',
+        });
+        clientWs.close();
+        return;
+      }
+
+      try {
+        await enforcePlatformSpendCaps(rawConfig);
+      } catch (capErr: unknown) {
+        sendClient({
+          type: 'error',
+          message:
+            capErr instanceof Error
+              ? capErr.message
+              : 'Platform spending cap reached.',
+        });
+        clientWs.close();
+        return;
+      }
+
+      const reserveCredits = rawConfig.creditRates.voiceRealtime || 6;
+      let reservationId = '';
+      try {
+        const resv = await reserveCreditsForUsage({
+          userId: wsUser.id,
+          feature: 'voice',
+          reserveAmount: reserveCredits,
+          description: `Realtime Voice (${requestedProvider.toUpperCase()})`,
+        });
+        reservationId = resv.reservationId;
+      } catch (resvErr: unknown) {
+        const msg =
+          resvErr instanceof Error
+            ? resvErr.message
+            : 'Insufficient credits for Realtime Voice.';
+        sendClient({
+          type: 'error',
+          code: msg.startsWith('RECHARGE_REQUIRED:')
+            ? 'RECHARGE_REQUIRED'
+            : 'RESERVE_FAILED',
+          message: msg.replace(/^RECHARGE_REQUIRED:\s*/, ''),
+        });
+        clientWs.close();
+        return;
+      }
+
+      let settled = false;
+      let audioFramesReceived = 0;
+      let geminiLiveSession: Awaited<
+        ReturnType<typeof connectGeminiLiveVoiceSession>
+      > | null = null;
+      let openaiUpstreamWs: WebSocket | null = null;
+
+      const settleSession = async (failed: boolean, failReason?: string) => {
+        if (settled) return;
+        settled = true;
+        try {
+          const shouldCharge = !failed && audioFramesReceived > 0;
+          await finalizeCreditReservation({
+            userId: wsUser.id,
+            reservationId,
+            reservedAmount: reserveCredits,
+            actualAmount: shouldCharge ? reserveCredits : 0,
+            feature: 'voice',
+            description: failed
+              ? failReason || 'Realtime voice failure refund'
+              : 'Realtime voice session completed',
+          });
+
+          if (shouldCharge) {
+            await db.insert(providerUsageLogs).values({
+              userId: wsUser.id,
+              provider: requestedProvider,
+              model:
+                requestedProvider === 'openai'
+                  ? 'gpt-4o-mini-realtime-preview'
+                  : 'gemini-3.8-live',
+              feature: 'voice',
+              promptTokens: 350,
+              completionTokens: 350,
+              totalTokens: 700,
+              providerCostUsd:
+                requestedProvider === 'openai' ? '0.014000' : '0.002200',
+              internalCreditsCharged: reserveCredits,
+            });
+          }
+        } catch (err) {
+          console.error('Realtime settlement error:', err);
+        }
+      };
+
+      if (requestedProvider === 'gemini') {
+        try {
+          geminiLiveSession = await connectGeminiLiveVoiceSession({
+            userFullName: wsUser.fullName,
+            voiceName: wsUser.preferredVoice,
+            onAudioBase64: (pcm24kBase64) => {
+              audioFramesReceived++;
+              sendClient({
+                type: 'audio',
+                sampleRate: 24000,
+                base64: pcm24kBase64,
+              });
+            },
+            onTranscript: (role, text) => {
+              sendClient({ type: 'transcript', role, text });
+            },
+            onInterrupted: () => {
+              sendClient({ type: 'interrupted' });
+            },
+            onError: async (safeError) => {
+              await recordProviderApiError({
+                actorUserId: wsUser.id,
+                actorEmail: wsUser.email,
+                provider: 'gemini',
+                model: 'gemini-3.8-live',
+                feature: 'voice_realtime',
+                status: 500,
+                errorCode: 'gemini_live_error',
+                safeMessage: safeError,
+              });
+              sendClient({ type: 'error', message: safeError });
+              await settleSession(true, safeError);
+              clientWs.close();
+            },
+          });
+
+          sendClient({
+            type: 'ready',
+            provider: 'gemini',
+            model: 'gemini-3.8-live',
+            creditsReserved: reserveCredits,
+          });
+        } catch (connErr: unknown) {
+          const meta = extractProviderErrorMeta(connErr);
+          await recordProviderApiError({
+            actorUserId: wsUser.id,
+            actorEmail: wsUser.email,
+            provider: 'gemini',
+            model: 'gemini-3.8-live',
+            feature: 'voice_realtime',
+            status: meta.status,
+            errorCode: meta.errorCode,
+            safeMessage: meta.safeMessage,
+          });
+          sendClient({ type: 'error', message: meta.safeMessage });
+          await settleSession(true, 'Gemini Live connect failed');
+          clientWs.close();
+          return;
+        }
+      } else {
+        // Official OpenAI Realtime WebSocket Bridge (strictly OpenAI — never falls back to Gemini)
+        try {
+          const headers = getOpenAIRealtimeAuthHeaders();
+          openaiUpstreamWs = new WebSocket(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview',
+            { headers }
+          );
+
+          openaiUpstreamWs.on('open', () => {
+            openaiUpstreamWs?.send(
+              JSON.stringify({
+                type: 'session.update',
+                session: {
+                  modalities: ['audio', 'text'],
+                  instructions: `You are QAAGA AGENT Realtime Voice Assistant speaking with ${wsUser.fullName}. Keep spoken responses concise and natural.`,
+                  voice: 'alloy',
+                  input_audio_format: 'pcm16',
+                  output_audio_format: 'pcm16',
+                  turn_detection: { type: 'server_vad' },
+                },
+              })
+            );
+            sendClient({
+              type: 'ready',
+              provider: 'openai',
+              model: 'gpt-4o-mini-realtime-preview',
+              creditsReserved: reserveCredits,
+            });
+          });
+
+          openaiUpstreamWs.on('message', (raw) => {
+            try {
+              const evt = JSON.parse(raw.toString()) as {
+                type?: string;
+                delta?: string;
+                transcript?: string;
+                error?: { message?: string; code?: string };
+              };
+              if (evt.type === 'response.audio.delta' && evt.delta) {
+                audioFramesReceived++;
+                sendClient({
+                  type: 'audio',
+                  sampleRate: 24000,
+                  base64: evt.delta,
+                });
+              } else if (
+                evt.type === 'response.audio_transcript.delta' &&
+                evt.delta
+              ) {
+                sendClient({
+                  type: 'transcript',
+                  role: 'assistant',
+                  text: evt.delta,
+                });
+              } else if (
+                evt.type ===
+                  'conversation.item.input_audio_transcription.completed' &&
+                evt.transcript
+              ) {
+                sendClient({
+                  type: 'transcript',
+                  role: 'user',
+                  text: evt.transcript,
+                });
+              } else if (evt.type === 'error') {
+                const meta = extractProviderErrorMeta(evt.error || evt);
+                sendClient({ type: 'error', message: meta.safeMessage });
+              }
+            } catch {
+              // ignore malformed upstream event
+            }
+          });
+
+          openaiUpstreamWs.on('unexpected-response', async (_reqUp, resUp) => {
+            const status = resUp.statusCode || 401;
+            const safeMsg =
+              status === 401
+                ? 'OpenAI Realtime failed (HTTP 401 — Invalid API Key). Configure a valid OPENAI_API_KEY in Settings > Secrets. Reserved credits refunded.'
+                : `OpenAI Realtime rejected connection (HTTP ${status}). Reserved credits refunded.`;
+            await recordProviderApiError({
+              actorUserId: wsUser.id,
+              actorEmail: wsUser.email,
+              provider: 'openai',
+              model: 'gpt-4o-mini-realtime-preview',
+              feature: 'voice_realtime',
+              status,
+              errorCode: `http_${status}`,
+              safeMessage: safeMsg,
+            });
+            sendClient({ type: 'error', message: safeMsg });
+            await settleSession(true, safeMsg);
+            clientWs.close();
+          });
+
+          openaiUpstreamWs.on('error', async (wsErr) => {
+            const meta = extractProviderErrorMeta(wsErr);
+            await recordProviderApiError({
+              actorUserId: wsUser.id,
+              actorEmail: wsUser.email,
+              provider: 'openai',
+              model: 'gpt-4o-mini-realtime-preview',
+              feature: 'voice_realtime',
+              status: meta.status,
+              errorCode: meta.errorCode,
+              safeMessage: meta.safeMessage,
+            });
+            sendClient({ type: 'error', message: meta.safeMessage });
+            await settleSession(true, meta.safeMessage);
+            clientWs.close();
+          });
+        } catch (initErr: unknown) {
+          const meta = extractProviderErrorMeta(initErr);
+          await recordProviderApiError({
+            actorUserId: wsUser.id,
+            actorEmail: wsUser.email,
+            provider: 'openai',
+            model: 'gpt-4o-mini-realtime-preview',
+            feature: 'voice_realtime',
+            status: meta.status,
+            errorCode: meta.errorCode,
+            safeMessage: meta.safeMessage,
+          });
+          sendClient({ type: 'error', message: meta.safeMessage });
+          await settleSession(true, meta.safeMessage);
+          clientWs.close();
+          return;
+        }
+      }
+
+      clientWs.on('message', (rawMsg) => {
+        try {
+          const msg = JSON.parse(rawMsg.toString()) as {
+            type?: string;
+            base64?: string;
+            text?: string;
+          };
+          if (msg.type === 'audio' && msg.base64) {
+            if (geminiLiveSession) {
+              geminiLiveSession.sendRealtimeInput({
+                media: {
+                  data: msg.base64,
+                  mimeType: 'audio/pcm;rate=16000',
+                },
+              });
+            } else if (
+              openaiUpstreamWs &&
+              openaiUpstreamWs.readyState === WebSocket.OPEN
+            ) {
+              openaiUpstreamWs.send(
+                JSON.stringify({
+                  type: 'input_audio_buffer.append',
+                  audio: msg.base64,
+                })
+              );
+            }
+          } else if (msg.type === 'text' && msg.text) {
+            if (geminiLiveSession) {
+              geminiLiveSession.sendClientContent({
+                turns: [
+                  {
+                    role: 'user',
+                    parts: [{ text: msg.text }],
+                  },
+                ],
+                turnComplete: true,
+              });
+            } else if (
+              openaiUpstreamWs &&
+              openaiUpstreamWs.readyState === WebSocket.OPEN
+            ) {
+              openaiUpstreamWs.send(
+                JSON.stringify({
+                  type: 'conversation.item.create',
+                  item: {
+                    type: 'message',
+                    role: 'user',
+                    content: [{ type: 'input_text', text: msg.text }],
+                  },
+                })
+              );
+              openaiUpstreamWs.send(JSON.stringify({ type: 'response.create' }));
+            }
+          }
+        } catch {
+          // ignore malformed client frame
+        }
+      });
+
+      clientWs.on('close', async () => {
+        try {
+          geminiLiveSession?.close();
+        } catch {
+          // ignore
+        }
+        try {
+          openaiUpstreamWs?.close();
+        } catch {
+          // ignore
+        }
+        await settleSession(false);
+      });
+    }
+  );
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`QAAGA AGENT SaaS Server listening on http://0.0.0.0:${PORT}`);
   });
 }

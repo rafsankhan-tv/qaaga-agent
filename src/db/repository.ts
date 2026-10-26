@@ -40,6 +40,7 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
     webSearch: 4,
     voiceStt: 3,
     voiceTts: 3,
+    voiceRealtime: 6,
   },
   toolsEnabled: {
     imageGeneration: true,
@@ -50,27 +51,58 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
   },
   openaiWallet: {
     purchasedUsd: 120.0,
+    dailySpendLimitUsd: 15.0,
     monthlySpendLimitUsd: 100.0,
     alertThresholdPct: 80,
     walletVerificationMode: 'admin-reconciled-estimate',
   },
   models: [
+    // 1. OpenAI Advanced Reasoning Models
     {
-      id: 'gpt-4o-mini',
-      label: 'QAAGA Fast (gpt-4o-mini)',
+      id: 'o3-mini',
+      label: 'OpenAI o3-mini (Reasoning)',
       provider: 'openai',
-      category: 'chat',
+      tier: 'openai-reasoning',
+      category: 'reasoning',
       enabled: true,
-      inputUsdPer1M: 0.15,
-      outputUsdPer1M: 0.6,
-      baseCreditCost: 2,
-      creditsPer1kTokens: 1,
-      description: 'Low-latency everyday assistant for drafting, translation & Q&A',
+      inputUsdPer1M: 1.1,
+      outputUsdPer1M: 4.4,
+      baseCreditCost: 6,
+      creditsPer1kTokens: 3,
+      description: 'Multi-step STEM, algorithms, SQL & architectural reasoning',
     },
     {
-      id: 'gpt-4o',
-      label: 'QAAGA Omni Flagship (gpt-4o)',
+      id: 'o4-mini',
+      label: 'OpenAI o4-mini (Advanced Reasoning)',
       provider: 'openai',
+      tier: 'openai-reasoning',
+      category: 'reasoning',
+      enabled: true,
+      inputUsdPer1M: 1.1,
+      outputUsdPer1M: 4.4,
+      baseCreditCost: 7,
+      creditsPer1kTokens: 4,
+      description: 'Next-gen fast reasoning for math, debugging & analytical workflows',
+    },
+    {
+      id: 'o3',
+      label: 'OpenAI o3 (Deep Reasoning)',
+      provider: 'openai',
+      tier: 'openai-reasoning',
+      category: 'reasoning',
+      enabled: true,
+      inputUsdPer1M: 2.0,
+      outputUsdPer1M: 8.0,
+      baseCreditCost: 10,
+      creditsPer1kTokens: 6,
+      description: 'Frontier deep reasoning for complex research & multi-step proofs',
+    },
+    // 2. OpenAI Standard Flagship Models
+    {
+      id: 'gpt-4o',
+      label: 'OpenAI GPT-4o (Standard Flagship)',
+      provider: 'openai',
+      tier: 'openai-standard',
       category: 'chat',
       enabled: true,
       inputUsdPer1M: 2.5,
@@ -80,16 +112,71 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
       description: 'High-accuracy multimodal flagship for code, vision & PDFs',
     },
     {
-      id: 'o3-mini',
-      label: 'QAAGA Deep Reasoning (o3-mini)',
+      id: 'gpt-4.1',
+      label: 'OpenAI GPT-4.1 (Standard Coding)',
       provider: 'openai',
-      category: 'reasoning',
+      tier: 'openai-standard',
+      category: 'chat',
       enabled: true,
-      inputUsdPer1M: 1.1,
-      outputUsdPer1M: 4.4,
-      baseCreditCost: 6,
+      inputUsdPer1M: 2.0,
+      outputUsdPer1M: 8.0,
+      baseCreditCost: 5,
       creditsPer1kTokens: 3,
-      description: 'Multi-step STEM, algorithms, SQL & architectural reasoning',
+      description: 'Long-context software engineering & structured instruction following',
+    },
+    // 3. OpenAI Economical Models
+    {
+      id: 'gpt-4o-mini',
+      label: 'OpenAI GPT-4o mini (Economical)',
+      provider: 'openai',
+      tier: 'openai-economical',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'Low-latency everyday assistant for drafting, translation & Q&A',
+    },
+    {
+      id: 'gpt-4.1-mini',
+      label: 'OpenAI GPT-4.1 mini (Economical)',
+      provider: 'openai',
+      tier: 'openai-economical',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.4,
+      outputUsdPer1M: 1.6,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'Balanced speed, coding intelligence & economical token pricing',
+    },
+    // 4. Google Gemini Models
+    {
+      id: 'gemini-3.8-flash',
+      label: 'Google Gemini 3.8 Flash',
+      provider: 'gemini',
+      tier: 'gemini',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'Fast multimodal reasoning, native PDF vision & Google Search grounding',
+    },
+    {
+      id: 'gemini-3.1-flash-lite',
+      label: 'Google Gemini 3.1 Flash Lite',
+      provider: 'gemini',
+      tier: 'gemini',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.075,
+      outputUsdPer1M: 0.3,
+      baseCreditCost: 1,
+      creditsPer1kTokens: 1,
+      description: 'Ultra-low-cost, high-throughput everyday chat & summarization',
     },
   ],
 };
@@ -518,13 +605,91 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
       .from(platformSettings)
       .where(eq(platformSettings.key, 'core_config'));
     if (rows.length === 0) return DEFAULT_PLATFORM_CONFIG;
+
+    const stored = JSON.parse(rows[0].valueJson) as Partial<PlatformConfigDTO>;
+    const storedById = new Map(
+      (stored.models || []).map((m) => [m.id, m] as const)
+    );
+
+    // Non-destructively merge default catalog models with any stored admin customizations
+    const mergedModels = DEFAULT_PLATFORM_CONFIG.models.map((defModel) => {
+      const existing = storedById.get(defModel.id);
+      if (!existing) return defModel;
+      storedById.delete(defModel.id);
+      return {
+        ...defModel,
+        ...existing,
+        provider:
+          existing.provider === 'bridge'
+            ? ('gemini' as const)
+            : existing.provider || defModel.provider,
+        tier: existing.tier || defModel.tier,
+      };
+    });
+
+    // Preserve any custom models added previously
+    for (const extra of storedById.values()) {
+      mergedModels.push({
+        ...extra,
+        provider: extra.provider === 'bridge' ? 'gemini' : extra.provider,
+      });
+    }
+
     return {
       ...DEFAULT_PLATFORM_CONFIG,
-      ...(JSON.parse(rows[0].valueJson) as Partial<PlatformConfigDTO>),
+      ...stored,
+      receiverNumbers: {
+        ...DEFAULT_PLATFORM_CONFIG.receiverNumbers,
+        ...(stored.receiverNumbers || {}),
+      },
+      creditRates: {
+        ...DEFAULT_PLATFORM_CONFIG.creditRates,
+        ...(stored.creditRates || {}),
+      },
+      toolsEnabled: {
+        ...DEFAULT_PLATFORM_CONFIG.toolsEnabled,
+        ...(stored.toolsEnabled || {}),
+      },
+      openaiWallet: {
+        ...DEFAULT_PLATFORM_CONFIG.openaiWallet,
+        ...(stored.openaiWallet || {}),
+      },
+      models: mergedModels,
     };
   } catch (error) {
     console.error('Failed to read platform config:', error);
     throw new Error('Could not load platform configuration.', { cause: error });
+  }
+}
+
+export async function recordProviderApiError(params: {
+  actorUserId?: number | null;
+  actorEmail: string;
+  provider: 'openai' | 'gemini';
+  model: string;
+  feature: string;
+  status: number | null;
+  errorCode: string;
+  safeMessage: string;
+}): Promise<void> {
+  try {
+    await db.insert(auditLogs).values({
+      actorUserId: params.actorUserId ?? null,
+      actorEmail: params.actorEmail,
+      action: 'PROVIDER_API_ERROR',
+      targetType: params.provider,
+      targetId: params.model,
+      detailsJson: JSON.stringify({
+        provider: params.provider,
+        model: params.model,
+        feature: params.feature,
+        status: params.status,
+        errorCode: params.errorCode,
+        message: params.safeMessage.slice(0, 320),
+      }),
+    });
+  } catch (err) {
+    console.error('Failed to record provider error log:', err);
   }
 }
 
@@ -533,17 +698,26 @@ export async function savePlatformConfig(
   actor: { id: number; email: string }
 ): Promise<PlatformConfigDTO> {
   try {
+    const cleanModels = (nextConfig.models || []).map((m) => {
+      const { available: _av, availabilityNote: _note, ...persisted } = m;
+      return persisted;
+    });
+    const toPersist: PlatformConfigDTO = {
+      ...nextConfig,
+      models: cleanModels,
+    };
+
     await db
       .insert(platformSettings)
       .values({
         key: 'core_config',
-        valueJson: JSON.stringify(nextConfig),
+        valueJson: JSON.stringify(toPersist),
         updatedAt: new Date(),
       })
       .onConflictDoUpdate({
         target: platformSettings.key,
         set: {
-          valueJson: JSON.stringify(nextConfig),
+          valueJson: JSON.stringify(toPersist),
           updatedAt: new Date(),
         },
       });
@@ -555,11 +729,13 @@ export async function savePlatformConfig(
       targetType: 'platform_settings',
       targetId: 'core_config',
       detailsJson: JSON.stringify({
-        receiverNumbers: nextConfig.receiverNumbers,
-        toolsEnabled: nextConfig.toolsEnabled,
+        receiverNumbers: toPersist.receiverNumbers,
+        toolsEnabled: toPersist.toolsEnabled,
+        dailySpendLimitUsd: toPersist.openaiWallet.dailySpendLimitUsd,
+        monthlySpendLimitUsd: toPersist.openaiWallet.monthlySpendLimitUsd,
       }),
     });
-    return nextConfig;
+    return toPersist;
   } catch (error) {
     console.error('Failed to save platform config:', error);
     throw new Error('Could not update platform settings.', { cause: error });
@@ -996,7 +1172,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       .select()
       .from(auditLogs)
       .orderBy(desc(auditLogs.id))
-      .limit(60);
+      .limit(90);
 
     const allMessages = await db
       .select()
@@ -1008,6 +1184,9 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
     for (const u of allUsers) userMap.set(u.id, u);
 
     const now = Date.now();
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+
     let activeUsers = 0;
     let pendingUsers = 0;
     let suspendedUsers = 0;
@@ -1044,7 +1223,11 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
     }
 
     let openaiUsedUsd = 0;
+    let openaiTodayUsd = 0;
+    let geminiUsedUsd = 0;
+    let geminiTodayUsd = 0;
     let totalTokensUsed = 0;
+
     const modelMap = new Map<
       string,
       {
@@ -1062,6 +1245,8 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         date: string;
         credits: number;
         usdCost: number;
+        openaiUsdCost: number;
+        geminiUsdCost: number;
         tokens: number;
         requests: number;
       }
@@ -1072,10 +1257,16 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
     >();
     const userProviderAgg = new Map<
       number,
-      { usdCost: number; requests: number; tokens: number; creditsCharged: number }
+      {
+        usdCost: number;
+        openaiUsdCost: number;
+        geminiUsdCost: number;
+        requests: number;
+        tokens: number;
+        creditsCharged: number;
+      }
     >();
 
-    // Seed last 10 days labels so bar chart is always rich & continuous
     for (let i = 9; i >= 0; i--) {
       const d = new Date(now - i * 24 * 60 * 60 * 1000);
       const label = d.toLocaleDateString('en-US', {
@@ -1086,6 +1277,8 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         date: label,
         credits: 0,
         usdCost: 0,
+        openaiUsdCost: 0,
+        geminiUsdCost: 0,
         tokens: 0,
         requests: 0,
       });
@@ -1093,7 +1286,20 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
 
     for (const log of allProviderLogs) {
       const usd = Number(log.providerCostUsd) || 0;
-      openaiUsedUsd += usd;
+      const isGemini =
+        log.provider === 'gemini' ||
+        log.provider === 'bridge' ||
+        log.model.startsWith('gemini');
+      const isToday = new Date(log.createdAt) >= todayStart;
+
+      if (isGemini) {
+        geminiUsedUsd += usd;
+        if (isToday) geminiTodayUsd += usd;
+      } else {
+        openaiUsedUsd += usd;
+        if (isToday) openaiTodayUsd += usd;
+      }
+
       totalTokensUsed += log.totalTokens;
 
       const dayLabel = new Date(log.createdAt).toLocaleDateString('en-US', {
@@ -1104,19 +1310,31 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         date: dayLabel,
         credits: 0,
         usdCost: 0,
+        openaiUsdCost: 0,
+        geminiUsdCost: 0,
         tokens: 0,
         requests: 0,
       };
-      dayEntry.usdCost = Number((dayEntry.usdCost + usd).toFixed(4));
+      dayEntry.usdCost = Number((dayEntry.usdCost + usd).toFixed(6));
+      if (isGemini) {
+        dayEntry.geminiUsdCost = Number(
+          (dayEntry.geminiUsdCost + usd).toFixed(6)
+        );
+      } else {
+        dayEntry.openaiUsdCost = Number(
+          (dayEntry.openaiUsdCost + usd).toFixed(6)
+        );
+      }
       dayEntry.tokens += log.totalTokens;
       dayEntry.credits += log.internalCreditsCharged;
       dayEntry.requests += 1;
       dailyMap.set(dayLabel, dayEntry);
 
-      const mKey = `${log.provider}:${log.model}`;
+      const normalizedProvider = isGemini ? 'gemini' : 'openai';
+      const mKey = `${normalizedProvider}:${log.model}`;
       const mEntry = modelMap.get(mKey) || {
         model: log.model,
-        provider: log.provider,
+        provider: normalizedProvider,
         totalTokens: 0,
         usdCost: 0,
         creditsCharged: 0,
@@ -1141,11 +1359,18 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
 
       const uAgg = userProviderAgg.get(log.userId) || {
         usdCost: 0,
+        openaiUsdCost: 0,
+        geminiUsdCost: 0,
         requests: 0,
         tokens: 0,
         creditsCharged: 0,
       };
       uAgg.usdCost = Number((uAgg.usdCost + usd).toFixed(6));
+      if (isGemini) {
+        uAgg.geminiUsdCost = Number((uAgg.geminiUsdCost + usd).toFixed(6));
+      } else {
+        uAgg.openaiUsdCost = Number((uAgg.openaiUsdCost + usd).toFixed(6));
+      }
       uAgg.requests += 1;
       uAgg.tokens += log.totalTokens;
       uAgg.creditsCharged += log.internalCreditsCharged;
@@ -1158,6 +1383,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       {
         assigned: number;
         used: number;
+        usedToday: number;
         remaining: number;
         chat: number;
         image: number;
@@ -1175,6 +1401,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       const agg = perUserLedger.get(l.userId) || {
         assigned: 0,
         used: 0,
+        usedToday: 0,
         remaining: 0,
         chat: 0,
         image: 0,
@@ -1196,6 +1423,9 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       ) {
         const spent = -l.deltaCredits;
         agg.used += spent;
+        if (new Date(l.createdAt) >= todayStart) {
+          agg.usedToday += spent;
+        }
         if (l.feature === 'chat') agg.chat += spent;
         if (l.feature === 'image') agg.image += spent;
         if (l.feature === 'pdf') agg.pdf += spent;
@@ -1215,6 +1445,12 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
     const remainingEstimatedUsd = Math.max(
       0,
       Number((purchasedUsd - openaiUsedUsd).toFixed(4))
+    );
+    const totalProviderUsedUsd = Number(
+      (openaiUsedUsd + geminiUsedUsd).toFixed(6)
+    );
+    const todayProviderUsedUsd = Number(
+      (openaiTodayUsd + geminiTodayUsd).toFixed(6)
     );
 
     const paymentsDTO: PaymentRequestDTO[] = allPayments.map((p) => {
@@ -1248,20 +1484,28 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
           fullName: u.fullName,
           email: u.email,
           usdCost: pAgg?.usdCost || 0,
+          openaiUsdCost: pAgg?.openaiUsdCost || 0,
+          geminiUsdCost: pAgg?.geminiUsdCost || 0,
           requests: pAgg?.requests || 0,
           tokens: pAgg?.tokens || 0,
-          creditsCharged: pAgg?.creditsCharged || Math.max(0, lAgg?.used || 0),
+          creditsCharged:
+            pAgg?.creditsCharged || Math.max(0, lAgg?.used || 0),
         };
       })
-      .sort((a, b) => b.usdCost - a.usdCost || b.creditsCharged - a.creditsCharged)
-      .slice(0, 8);
+      .sort(
+        (a, b) =>
+          b.usdCost - a.usdCost || b.creditsCharged - a.creditsCharged
+      )
+      .slice(0, 12);
 
     const activityLogs = allMessages.map((m) => {
       const u = userMap.get(m.userId);
       let attachmentNames: string[] = [];
       if (m.attachmentsJson) {
         try {
-          const parsed = JSON.parse(m.attachmentsJson) as Array<{ name: string }>;
+          const parsed = JSON.parse(m.attachmentsJson) as Array<{
+            name: string;
+          }>;
           attachmentNames = parsed.map((a) => a.name);
         } catch {
           attachmentNames = [];
@@ -1284,6 +1528,37 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         createdAt: m.createdAt.toISOString(),
       };
     });
+
+    const providerErrors = recentAudits
+      .filter((a) => a.action === 'PROVIDER_API_ERROR')
+      .map((a) => {
+        let parsed: {
+          provider?: string;
+          model?: string;
+          feature?: string;
+          status?: number | null;
+          errorCode?: string;
+          message?: string;
+        } = {};
+        if (a.detailsJson) {
+          try {
+            parsed = JSON.parse(a.detailsJson);
+          } catch {
+            // ignore
+          }
+        }
+        return {
+          id: a.id,
+          provider: parsed.provider || a.targetType || 'openai',
+          model: parsed.model || a.targetId || 'unknown',
+          feature: parsed.feature || 'chat',
+          status: parsed.status ?? null,
+          errorCode: parsed.errorCode || 'provider_error',
+          message: parsed.message || 'Provider request failed.',
+          userEmail: a.actorEmail,
+          createdAt: a.createdAt.toISOString(),
+        };
+      });
 
     const announcements = recentAudits
       .filter((a) => a.action === 'BROADCAST_ANNOUNCEMENT')
@@ -1316,12 +1591,18 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         pendingPaymentsBdt,
         approvedPaymentsCount,
         openaiPurchasedUsd: purchasedUsd,
-        openaiUsedUsd: Number(openaiUsedUsd.toFixed(4)),
+        openaiUsedUsd: Number(openaiUsedUsd.toFixed(6)),
+        openaiTodayUsd: Number(openaiTodayUsd.toFixed(6)),
+        geminiUsedUsd: Number(geminiUsedUsd.toFixed(6)),
+        geminiTodayUsd: Number(geminiTodayUsd.toFixed(6)),
+        totalProviderUsedUsd,
+        todayProviderUsedUsd,
         openaiRemainingEstimatedUsd: remainingEstimatedUsd,
+        dailySpendLimitUsd: config.openaiWallet.dailySpendLimitUsd ?? 15.0,
         monthlySpendLimitUsd: config.openaiWallet.monthlySpendLimitUsd,
         totalTokensUsed,
         walletSourceLabel:
-          'Admin-Reconciled Estimate (Purchased Budget minus Measured Provider Token Spend)',
+          'Separate Provider Metering (OpenAI USD vs. Google Gemini USD · Reconciled Against Daily & Monthly Caps)',
       },
       creditPool: {
         totalAssigned: poolTotalAssigned,
@@ -1344,6 +1625,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         const agg = perUserLedger.get(u.id) || {
           assigned: 0,
           used: 0,
+          usedToday: 0,
           remaining: 0,
           chat: 0,
           image: 0,
@@ -1351,6 +1633,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
           search: 0,
           voice: 0,
         };
+        const pAgg = userProviderAgg.get(u.id);
         const exp = u.subscriptionExpiresAt
           ? new Date(u.subscriptionExpiresAt).getTime()
           : 0;
@@ -1365,6 +1648,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
             : null,
           isExpired: u.status === 'ACTIVE' && exp <= now,
           dailyCreditLimit: u.dailyCreditLimit,
+          usedTodayCredits: Math.max(0, agg.usedToday),
           latestPlanBdt: latestPlanByUser.get(u.id) || null,
           creditsAssigned: Math.max(0, agg.assigned),
           creditsUsed: Math.max(0, agg.used),
@@ -1374,11 +1658,17 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
           pdfCredits: Math.max(0, agg.pdf),
           searchCredits: Math.max(0, agg.search),
           voiceCredits: Math.max(0, agg.voice),
+          openaiUsdCost: pAgg?.openaiUsdCost || 0,
+          geminiUsdCost: pAgg?.geminiUsdCost || 0,
+          totalUsdCost: pAgg?.usdCost || 0,
+          totalTokens: pAgg?.tokens || 0,
+          apiRequests: pAgg?.requests || 0,
           createdAt: u.createdAt.toISOString(),
         };
       }),
       payments: paymentsDTO,
       activityLogs,
+      providerErrors,
       announcements,
       auditLogs: recentAudits.map((a) => ({
         id: a.id,
