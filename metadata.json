@@ -1,0 +1,6 @@
+{
+  "name": "QAAGA AGENT — Next-Gen Multimodal AI Workspace",
+  "description": "Full-stack multimodal AI workspace featuring real-time streaming chat, live web search grounding, PDF & document intelligence, neural voice conversations, vector studio synthesis, and instant BDT credit billing.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
