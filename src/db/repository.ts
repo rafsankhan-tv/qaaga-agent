@@ -26,6 +26,10 @@ import type {
 } from '../types/qaaga.ts';
 
 export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
+  branding: {
+    logoDataUrl: null,
+    faviconDataUrl: null,
+  },
   receiverNumbers: {
     bKash: '01711-948201 (Merchant)',
     Nagad: '01819-550312 (Merchant)',
@@ -638,6 +642,18 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
     return {
       ...DEFAULT_PLATFORM_CONFIG,
       ...stored,
+      branding: {
+        logoDataUrl:
+          typeof stored.branding?.logoDataUrl === 'string' &&
+          stored.branding.logoDataUrl.trim().length > 0
+            ? stored.branding.logoDataUrl.trim()
+            : null,
+        faviconDataUrl:
+          typeof stored.branding?.faviconDataUrl === 'string' &&
+          stored.branding.faviconDataUrl.trim().length > 0
+            ? stored.branding.faviconDataUrl.trim()
+            : null,
+      },
       receiverNumbers: {
         ...DEFAULT_PLATFORM_CONFIG.receiverNumbers,
         ...(stored.receiverNumbers || {}),
@@ -693,6 +709,28 @@ export async function recordProviderApiError(params: {
   }
 }
 
+function sanitizeBrandAssetUrl(
+  raw: string | null | undefined,
+  label: string
+): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 3_000_000) {
+    throw new Error(`${label} exceeds maximum size (approx. 2 MB). Please upload a smaller image.`);
+  }
+  const isAllowedDataUrl = /^data:image\/(png|svg\+xml|webp|jpeg|jpg|gif|x-icon|vnd\.microsoft\.icon);base64,[A-Za-z0-9+/=\s]+$/i.test(
+    trimmed
+  );
+  const isAllowedHttpUrl = /^https?:\/\/[^\s"'<>]+$/i.test(trimmed);
+  if (!isAllowedDataUrl && !isAllowedHttpUrl) {
+    throw new Error(
+      `${label} must be a valid image upload (PNG, SVG, WEBP, JPG, GIF, ICO) or direct https:// URL.`
+    );
+  }
+  return trimmed;
+}
+
 export async function savePlatformConfig(
   nextConfig: PlatformConfigDTO,
   actor: { id: number; email: string }
@@ -702,8 +740,19 @@ export async function savePlatformConfig(
       const { available: _av, availabilityNote: _note, ...persisted } = m;
       return persisted;
     });
+    const sanitizedBranding = {
+      logoDataUrl: sanitizeBrandAssetUrl(
+        nextConfig.branding?.logoDataUrl,
+        'Logo Icon'
+      ),
+      faviconDataUrl: sanitizeBrandAssetUrl(
+        nextConfig.branding?.faviconDataUrl,
+        'Favicon'
+      ),
+    };
     const toPersist: PlatformConfigDTO = {
       ...nextConfig,
+      branding: sanitizedBranding,
       models: cleanModels,
     };
 
@@ -729,6 +778,8 @@ export async function savePlatformConfig(
       targetType: 'platform_settings',
       targetId: 'core_config',
       detailsJson: JSON.stringify({
+        hasCustomLogo: Boolean(sanitizedBranding.logoDataUrl),
+        hasCustomFavicon: Boolean(sanitizedBranding.faviconDataUrl),
         receiverNumbers: toPersist.receiverNumbers,
         toolsEnabled: toPersist.toolsEnabled,
         dailySpendLimitUsd: toPersist.openaiWallet.dailySpendLimitUsd,
@@ -738,7 +789,10 @@ export async function savePlatformConfig(
     return toPersist;
   } catch (error) {
     console.error('Failed to save platform config:', error);
-    throw new Error('Could not update platform settings.', { cause: error });
+    throw new Error(
+      error instanceof Error ? error.message : 'Could not update platform settings.',
+      { cause: error }
+    );
   }
 }
 

@@ -25,6 +25,7 @@ export type NavSection =
   | 'admin-image-logs'
   | 'admin-pdf-logs'
   | 'admin-announcements'
+  | 'admin-branding'
   | 'admin-models'
   | 'admin-audit';
 
@@ -121,7 +122,13 @@ export interface ModelConfigItem {
   description: string;
 }
 
+export interface BrandIdentityConfig {
+  logoDataUrl: string | null;
+  faviconDataUrl: string | null;
+}
+
 export interface PlatformConfigDTO {
+  branding?: BrandIdentityConfig;
   receiverNumbers: {
     bKash: string;
     Nagad: string;

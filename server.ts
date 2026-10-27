@@ -144,6 +144,57 @@ async function startServer() {
     }
   });
 
+  const DEFAULT_QAAGA_BRAND_SVG = `<svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg"><rect width="40" height="40" rx="11" fill="#059669"/><path d="M20 7.5L30.8 13.75V26.25L20 32.5L9.2 26.25V13.75L20 7.5Z" stroke="white" stroke-width="2.4" stroke-linejoin="round"/><rect x="15.5" y="15.5" width="9" height="9" rx="2.5" transform="rotate(45 20 20)" fill="#A7F3D0"/><path d="M23.5 23.5L29.5 29.5" stroke="#ECFDF5" stroke-width="2.8" stroke-linecap="round"/></svg>`;
+
+  const sendBrandAssetResponse = (
+    res: express.Response,
+    assetUrl: string | null | undefined
+  ) => {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    if (typeof assetUrl === 'string' && assetUrl.trim().length > 0) {
+      const trimmed = assetUrl.trim();
+      const dataMatch = trimmed.match(
+        /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i
+      );
+      if (dataMatch) {
+        const mime = dataMatch[1].toLowerCase();
+        const buf = Buffer.from(dataMatch[2].replace(/\s+/g, ''), 'base64');
+        res.setHeader('Content-Type', mime);
+        res.send(buf);
+        return;
+      }
+      if (/^https?:\/\//i.test(trimmed)) {
+        res.redirect(302, trimmed);
+        return;
+      }
+    }
+    res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+    res.send(DEFAULT_QAAGA_BRAND_SVG);
+  };
+
+  // Public Dynamic Favicon & Logo Endpoints (Reflects Admin Panel Branding Instantly)
+  app.get('/api/public/favicon', async (_req, res) => {
+    try {
+      const rawConfig = await getPlatformConfig();
+      const iconSource =
+        rawConfig.branding?.faviconDataUrl ||
+        rawConfig.branding?.logoDataUrl ||
+        null;
+      sendBrandAssetResponse(res, iconSource);
+    } catch {
+      sendBrandAssetResponse(res, null);
+    }
+  });
+
+  app.get('/api/public/logo', async (_req, res) => {
+    try {
+      const rawConfig = await getPlatformConfig();
+      sendBrandAssetResponse(res, rawConfig.branding?.logoDataUrl || null);
+    } catch {
+      sendBrandAssetResponse(res, null);
+    }
+  });
+
   // Public Front-Page Hydrator (Models, Recharge Plans & Capabilities for Unauthenticated Visitors)
   app.get('/api/public/frontpage', async (_req, res) => {
     try {

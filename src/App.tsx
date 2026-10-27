@@ -6,6 +6,7 @@ import { AuthGateModal, RechargeGateModal } from './components/GateModals';
 import { DarkNavySidebar } from './components/DarkNavySidebar';
 import { WorkspaceHeader } from './components/WorkspaceHeader';
 import { AdminPortalLayout } from './components/AdminPortalLayout';
+import { setRuntimeBrandLogo } from './components/BrandIcons';
 import {
   ChatWorkspaceView,
   HistorySearchPanel,
@@ -34,6 +35,10 @@ import type {
 } from './types/qaaga';
 
 const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
+  branding: {
+    logoDataUrl: null,
+    faviconDataUrl: null,
+  },
   receiverNumbers: {
     bKash: '01711-000000 (Personal)',
     Nagad: '01811-000000 (Personal)',
@@ -262,6 +267,36 @@ function QaagaAppShell() {
       : workspace?.user.theme || user?.theme || 'light';
     document.documentElement.classList.toggle('dark', activeTheme === 'dark');
   }, [isGuest, guestTheme, workspace?.user.theme, user?.theme]);
+
+  // Sync Admin-configured Logo Icon & Browser Tab Favicon live across the entire platform
+  const activeBranding =
+    workspace?.config?.branding ?? publicMeta.config?.branding;
+  useEffect(() => {
+    const logoUrl = activeBranding?.logoDataUrl || null;
+    const faviconUrl =
+      activeBranding?.faviconDataUrl ||
+      activeBranding?.logoDataUrl ||
+      '/api/public/favicon';
+
+    setRuntimeBrandLogo(logoUrl);
+
+    const applyHeadIcon = (id: string, rel: string, href: string) => {
+      let link = document.getElementById(id) as HTMLLinkElement | null;
+      if (!link) {
+        link = document.createElement('link');
+        link.id = id;
+        link.rel = rel;
+        document.head.appendChild(link);
+      }
+      if (link.getAttribute('href') !== href) {
+        link.setAttribute('href', href);
+      }
+    };
+
+    applyHeadIcon('qaaga-favicon', 'icon', faviconUrl);
+    applyHeadIcon('qaaga-shortcut-favicon', 'shortcut icon', faviconUrl);
+    applyHeadIcon('qaaga-apple-icon', 'apple-touch-icon', faviconUrl);
+  }, [activeBranding?.logoDataUrl, activeBranding?.faviconDataUrl]);
 
   const openLoginModal = useCallback(
     (reasonFeature?: string, pendingNav?: NavSection) => {
@@ -1241,6 +1276,9 @@ function QaagaAppShell() {
             const data = await res.json();
             if (!res.ok) {
               throw new Error(data.error || 'Configuration save failed.');
+            }
+            if (data.config) {
+              setPublicMeta((prev) => ({ ...prev, config: data.config }));
             }
             await fetchWorkspace();
             await fetchAdminDashboard();

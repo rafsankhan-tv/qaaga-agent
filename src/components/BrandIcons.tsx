@@ -1,10 +1,34 @@
-import React from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 
-/**
- * Original QAAGA AGENT Geometric Prism & Q-Monogram Brand Mark
- * Intentionally distinct from OpenAI / ChatGPT logos.
- */
-export function QaagaLogo({ className = 'w-8 h-8' }: { className?: string }) {
+let runtimeLogoDataUrl: string | null = null;
+const brandLogoListeners = new Set<() => void>();
+
+export function setRuntimeBrandLogo(nextLogoUrl: string | null) {
+  const normalized =
+    typeof nextLogoUrl === 'string' && nextLogoUrl.trim().length > 0
+      ? nextLogoUrl.trim()
+      : null;
+  if (runtimeLogoDataUrl === normalized) return;
+  runtimeLogoDataUrl = normalized;
+  brandLogoListeners.forEach((listener) => listener());
+}
+
+function subscribeBrandLogo(listener: () => void) {
+  brandLogoListeners.add(listener);
+  return () => {
+    brandLogoListeners.delete(listener);
+  };
+}
+
+function getBrandLogoSnapshot() {
+  return runtimeLogoDataUrl;
+}
+
+export function DefaultQaagaLogoSvg({
+  className = 'w-8 h-8',
+}: {
+  className?: string;
+}) {
   return (
     <svg
       viewBox="0 0 40 40"
@@ -37,6 +61,44 @@ export function QaagaLogo({ className = 'w-8 h-8' }: { className?: string }) {
       />
     </svg>
   );
+}
+
+/**
+ * QAAGA AGENT Brand Mark — Automatically renders Administrator-configured
+ * custom Logo Icon when set, or falls back to the built-in Geometric Q-Monogram.
+ */
+export function QaagaLogo({
+  className = 'w-8 h-8',
+  overrideSrc,
+}: {
+  className?: string;
+  overrideSrc?: string | null;
+}) {
+  const globalLogo = useSyncExternalStore(
+    subscribeBrandLogo,
+    getBrandLogoSnapshot,
+    getBrandLogoSnapshot
+  );
+  const effectiveSrc =
+    overrideSrc !== undefined ? overrideSrc : globalLogo;
+  const [imgFailed, setImgFailed] = useState(false);
+
+  useEffect(() => {
+    setImgFailed(false);
+  }, [effectiveSrc]);
+
+  if (effectiveSrc && !imgFailed) {
+    return (
+      <img
+        src={effectiveSrc}
+        alt="QAAGA AGENT Logo"
+        onError={() => setImgFailed(true)}
+        className={`${className} object-contain rounded-lg shrink-0 select-none`}
+      />
+    );
+  }
+
+  return <DefaultQaagaLogoSvg className={className} />;
 }
 
 export function BkashIcon({ className = 'w-6 h-6' }: { className?: string }) {

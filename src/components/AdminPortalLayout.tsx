@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   FileText,
   Megaphone,
+  Palette,
   Settings,
   Search,
   Calendar,
@@ -128,6 +129,7 @@ export function AdminPortalLayout({
     { id: 'admin-image-logs', label: 'Image Logs', Icon: ImageIcon },
     { id: 'admin-pdf-logs', label: 'PDF Logs', Icon: FileText },
     { id: 'admin-announcements', label: 'Announcements', Icon: Megaphone },
+    { id: 'admin-branding', label: 'Logo & Favicon', Icon: Palette },
     { id: 'admin-models', label: 'Settings', Icon: Settings },
   ];
 

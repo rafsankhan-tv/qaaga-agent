@@ -34,6 +34,10 @@ import {
   Plus,
   Pencil,
   Megaphone,
+  Palette,
+  Upload,
+  RotateCcw,
+  Copy,
   ChevronDown,
   Send,
   CheckCircle2,
@@ -46,7 +50,11 @@ import type {
   ProviderDiagnosticsDTO,
   RechargePackageDTO,
 } from '../types/qaaga';
-import { UserAvatarBadge } from './BrandIcons';
+import {
+  DefaultQaagaLogoSvg,
+  QaagaLogo,
+  UserAvatarBadge,
+} from './BrandIcons';
 
 function downloadCsv(filename: string, csvText: string) {
   const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8' });
@@ -167,6 +175,9 @@ export function AdminConsoleViews({
   const [userLimits, setUserLimits] = useState<Record<number, number>>({});
   const [userBonus, setUserBonus] = useState<Record<number, number>>({});
   const [configSaved, setConfigSaved] = useState(false);
+  const [brandingSaving, setBrandingSaving] = useState(false);
+  const [brandingSaved, setBrandingSaved] = useState(false);
+  const [brandingError, setBrandingError] = useState<string | null>(null);
 
   // Announcement Composer
   const [annTitle, setAnnTitle] = useState('');
@@ -242,6 +253,374 @@ export function AdminConsoleViews({
   const openScreenshot = async (paymentId: number) => {
     const data = await onFetchScreenshot(paymentId);
     setScreenshotModal(data);
+  };
+
+  const handleBrandFileUpload = (
+    target: 'logoDataUrl' | 'faviconDataUrl',
+    file: File | undefined
+  ) => {
+    if (!file) return;
+    setBrandingError(null);
+    const maxBytes = 2 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      setBrandingError(
+        `${target === 'logoDataUrl' ? 'Logo Icon' : 'Favicon'} file is too large (${(
+          file.size /
+          (1024 * 1024)
+        ).toFixed(2)} MB). Maximum allowed size is 2.00 MB.`
+      );
+      return;
+    }
+    const allowedMime = [
+      'image/png',
+      'image/svg+xml',
+      'image/webp',
+      'image/jpeg',
+      'image/jpg',
+      'image/gif',
+      'image/x-icon',
+      'image/vnd.microsoft.icon',
+    ];
+    const isIcoExt = file.name.toLowerCase().endsWith('.ico');
+    if (!allowedMime.includes(file.type) && !isIcoExt) {
+      setBrandingError(
+        'Unsupported image format. Please upload PNG, SVG, WEBP, JPG, GIF, or ICO.'
+      );
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      let result = String(reader.result || '');
+      if (isIcoExt && result.startsWith('data:application/octet-stream;base64,')) {
+        result = result.replace(
+          'data:application/octet-stream;base64,',
+          'data:image/x-icon;base64,'
+        );
+      }
+      setDraftConfig((prev) => ({
+        ...prev,
+        branding: {
+          logoDataUrl: prev.branding?.logoDataUrl ?? null,
+          faviconDataUrl: prev.branding?.faviconDataUrl ?? null,
+          [target]: result,
+        },
+      }));
+    };
+    reader.onerror = () => {
+      setBrandingError('Failed to read selected image file.');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleSaveBrandingNow = async () => {
+    setBrandingError(null);
+    setBrandingSaving(true);
+    try {
+      await onSaveConfig(draftConfig);
+      setBrandingSaved(true);
+      setTimeout(() => setBrandingSaved(false), 2600);
+    } catch (err: unknown) {
+      setBrandingError(
+        err instanceof Error ? err.message : 'Failed to save branding assets.'
+      );
+    } finally {
+      setBrandingSaving(false);
+    }
+  };
+
+  const renderBrandingManagerCard = () => {
+    const draftLogo = draftConfig.branding?.logoDataUrl || null;
+    const draftFavicon = draftConfig.branding?.faviconDataUrl || null;
+    const effectiveFaviconPreview = draftFavicon || draftLogo;
+
+    return (
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Palette className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
+                Platform Brand Identity — Logo Icon & Favicon
+              </h2>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+              Upload your custom Logo Icon and Browser Tab Favicon (PNG, SVG, WEBP, JPG, or ICO up to 2 MB, or paste a direct HTTPS image URL). Changes apply live across the Front Page, User Sidebar, Chat Avatar, Login Modals, Admin Portal, and Browser Tab.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            {brandingSaved && (
+              <span className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Logo & Favicon Applied Live!</span>
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={brandingSaving}
+              onClick={handleSaveBrandingNow}
+              className="px-4 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span>{brandingSaving ? 'Saving...' : 'Save Logo & Favicon'}</span>
+            </button>
+          </div>
+        </div>
+
+        {brandingError && (
+          <div className="rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 px-3.5 py-2.5 text-xs text-rose-700 dark:text-rose-300 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>{brandingError}</span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          {/* 1. LOGO ICON CONFIGURATOR */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-4 bg-slate-50/50 dark:bg-slate-950/30">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-heading font-bold text-slate-900 dark:text-white">
+                  1. Website Logo Icon
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Displayed in headers, dark navy sidebar, chat assistant avatar & auth dialogs.
+                </p>
+              </div>
+              <span
+                className={`px-2 py-0.5 rounded text-[10.5px] font-mono font-semibold ${
+                  draftLogo
+                    ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                {draftLogo ? 'Custom Active' : 'Default SVG'}
+              </span>
+            </div>
+
+            {/* Dual Light & Dark Surface Live Lockup Preview */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div className="rounded-xl bg-white border border-slate-200 p-3 flex items-center gap-2.5">
+                <QaagaLogo className="w-9 h-9" overrideSrc={draftLogo} />
+                <div className="min-w-0">
+                  <p className="font-heading font-extrabold text-xs text-slate-900 truncate">
+                    QAAGA AGENT
+                  </p>
+                  <p className="text-[10px] text-slate-400">Light Header</p>
+                </div>
+              </div>
+
+              <div className="rounded-xl bg-[#0D1425] border border-slate-800 p-3 flex items-center gap-2.5">
+                <QaagaLogo className="w-9 h-9" overrideSrc={draftLogo} />
+                <div className="min-w-0">
+                  <p className="font-heading font-extrabold text-xs text-white truncate">
+                    QAAGA AGENT
+                  </p>
+                  <p className="text-[10px] text-slate-400">Dark Sidebar</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="px-3.5 py-2 rounded-xl bg-slate-900 dark:bg-emerald-700 hover:opacity-90 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer">
+                <Upload className="w-3.5 h-3.5" />
+                <span>Upload Logo Icon</span>
+                <input
+                  type="file"
+                  accept="image/png,image/svg+xml,image/webp,image/jpeg,image/gif,image/x-icon,.ico"
+                  className="hidden"
+                  onChange={(e) => {
+                    handleBrandFileUpload('logoDataUrl', e.target.files?.[0]);
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+
+              {draftLogo && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDraftConfig((prev) => ({
+                      ...prev,
+                      branding: {
+                        logoDataUrl: null,
+                        faviconDataUrl: prev.branding?.faviconDataUrl ?? null,
+                      },
+                    }))
+                  }
+                  className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Default</span>
+                </button>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 mb-1">
+                Or Paste Direct Logo Image URL (HTTPS)
+              </label>
+              <input
+                type="url"
+                value={
+                  draftLogo && /^https?:\/\//i.test(draftLogo) ? draftLogo : ''
+                }
+                onChange={(e) => {
+                  const val = e.target.value.trim();
+                  setDraftConfig((prev) => ({
+                    ...prev,
+                    branding: {
+                      logoDataUrl: val || null,
+                      faviconDataUrl: prev.branding?.faviconDataUrl ?? null,
+                    },
+                  }));
+                }}
+                placeholder="https://example.com/logo.png"
+                className="w-full px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-xs"
+              />
+            </div>
+          </div>
+
+          {/* 2. FAVICON CONFIGURATOR */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-4 bg-slate-50/50 dark:bg-slate-950/30">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-heading font-bold text-slate-900 dark:text-white">
+                  2. Browser Tab Favicon
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Shown in browser tabs, bookmarks & mobile home-screen shortcuts (32×32 / SVG / ICO).
+                </p>
+              </div>
+              <span
+                className={`px-2 py-0.5 rounded text-[10.5px] font-mono font-semibold ${
+                  draftFavicon
+                    ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
+                    : draftLogo
+                    ? 'bg-sky-100 dark:bg-sky-950/60 text-sky-700 dark:text-sky-300'
+                    : 'bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                {draftFavicon
+                  ? 'Custom Favicon'
+                  : draftLogo
+                  ? 'Inheriting Logo'
+                  : 'Default Icon'}
+              </span>
+            </div>
+
+            {/* Realistic Browser Tab Chrome Mockup */}
+            <div className="rounded-xl bg-slate-200/80 dark:bg-slate-800 p-2.5 border border-slate-300/70 dark:border-slate-700">
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1 px-1.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-rose-400" />
+                  <span className="w-2.5 h-2.5 rounded-full bg-amber-400" />
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+                </div>
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-t-lg rounded-b-md bg-white dark:bg-slate-900 shadow-2xs max-w-[250px] border border-slate-200/80 dark:border-slate-700">
+                  {effectiveFaviconPreview ? (
+                    <img
+                      src={effectiveFaviconPreview}
+                      alt="Favicon Preview"
+                      className="w-4 h-4 object-contain rounded-xs shrink-0"
+                    />
+                  ) : (
+                    <DefaultQaagaLogoSvg className="w-4 h-4 shrink-0" />
+                  )}
+                  <span className="text-[11px] font-medium text-slate-800 dark:text-slate-200 truncate">
+                    QAAGA AGENT — Next-Gen AI
+                  </span>
+                  <X className="w-3 h-3 text-slate-400 shrink-0 ml-1" />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="px-3.5 py-2 rounded-xl bg-slate-900 dark:bg-emerald-700 hover:opacity-90 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer">
+                <Upload className="w-3.5 h-3.5" />
+                <span>Upload Favicon</span>
+                <input
+                  type="file"
+                  accept="image/png,image/svg+xml,image/webp,image/x-icon,image/vnd.microsoft.icon,.ico"
+                  className="hidden"
+                  onChange={(e) => {
+                    handleBrandFileUpload(
+                      'faviconDataUrl',
+                      e.target.files?.[0]
+                    );
+                    e.currentTarget.value = '';
+                  }}
+                />
+              </label>
+
+              {draftLogo && draftFavicon !== draftLogo && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDraftConfig((prev) => ({
+                      ...prev,
+                      branding: {
+                        logoDataUrl: prev.branding?.logoDataUrl ?? null,
+                        faviconDataUrl: prev.branding?.logoDataUrl ?? null,
+                      },
+                    }))
+                  }
+                  className="px-3 py-2 rounded-xl border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  <span>Use Logo as Favicon</span>
+                </button>
+              )}
+
+              {draftFavicon && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDraftConfig((prev) => ({
+                      ...prev,
+                      branding: {
+                        logoDataUrl: prev.branding?.logoDataUrl ?? null,
+                        faviconDataUrl: null,
+                      },
+                    }))
+                  }
+                  className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Default</span>
+                </button>
+              )}
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-500 mb-1">
+                Or Paste Direct Favicon URL (HTTPS)
+              </label>
+              <input
+                type="url"
+                value={
+                  draftFavicon && /^https?:\/\//i.test(draftFavicon)
+                    ? draftFavicon
+                    : ''
+                }
+                onChange={(e) => {
+                  const val = e.target.value.trim();
+                  setDraftConfig((prev) => ({
+                    ...prev,
+                    branding: {
+                      logoDataUrl: prev.branding?.logoDataUrl ?? null,
+                      faviconDataUrl: val || null,
+                    },
+                  }));
+                }}
+                placeholder="https://example.com/favicon.ico"
+                className="w-full px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono text-xs"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const handleSavePlanModal = async (e: React.FormEvent) => {
@@ -549,7 +928,16 @@ export function AdminConsoleViews({
             </p>
           </div>
 
-          <div className="relative flex items-center gap-2">
+          <div className="relative flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onSelectSection('admin-branding')}
+              className="px-3 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-200 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 flex items-center gap-1.5 cursor-pointer"
+            >
+              <Palette className="w-3.5 h-3.5" />
+              <span>Logo & Favicon</span>
+            </button>
+
             <button
               type="button"
               onClick={onRefresh}
@@ -2839,18 +3227,41 @@ export function AdminConsoleViews({
   }
 
   /* ==========================================================================
+   * 9B. DEDICATED LOGO ICON & FAVICON STUDIO (`admin-branding`)
+   * ======================================================================== */
+  if (section === 'admin-branding') {
+    return (
+      <div className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
+        <div>
+          <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
+            Logo Icon & Favicon Studio
+          </h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
+            Upload or link custom brand icons for your website header, sidebar, chat assistant, and browser tab favicon.
+          </p>
+        </div>
+
+        {renderBrandingManagerCard()}
+      </div>
+    );
+  }
+
+  /* ==========================================================================
    * 10. PLATFORM SETTINGS, MFS NUMBERS, MODELS & AUDIT LOGS (`admin-models` | `admin-audit`)
    * ======================================================================== */
   return (
     <div className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
       <div>
         <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-          Platform Settings, MFS Numbers, Models & Audit Trail
+          Platform Settings, Branding, MFS Numbers, Models & Audit Trail
         </h1>
         <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-          Configure bKash / Nagad / Rocket merchant numbers, toggle AI tools & models, and review security audit logs.
+          Customize Logo Icon & Favicon, configure bKash / Nagad / Rocket merchant numbers, toggle AI tools & models, and review security audit logs.
         </p>
       </div>
+
+      {/* Brand Identity (Logo Icon & Favicon) */}
+      {renderBrandingManagerCard()}
 
       {/* Receiver Numbers */}
       <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4">

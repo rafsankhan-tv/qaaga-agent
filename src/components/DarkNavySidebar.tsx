@@ -17,6 +17,7 @@ import {
   Sliders,
   Cpu,
   FileSpreadsheet,
+  Palette,
   LogIn,
   LogOut,
   Moon,
@@ -112,6 +113,7 @@ export function DarkNavySidebar({
       badge: pendingAdminBadges?.payments,
     },
     { id: 'admin-pricing', label: 'Packages & Rates', Icon: Sliders },
+    { id: 'admin-branding', label: 'Logo & Favicon', Icon: Palette },
     { id: 'admin-models', label: 'Models, Tools & Limits', Icon: Cpu },
     { id: 'admin-audit', label: 'Audit Logs', Icon: FileSpreadsheet },
   ];
