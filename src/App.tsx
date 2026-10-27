@@ -26,6 +26,7 @@ import type {
   AdminDashboardDTO,
   ChatMessageDTO,
   ChatSessionDTO,
+  GroundingLink,
   NavSection,
   PaymentMethodType,
   PlatformConfigDTO,
@@ -85,20 +86,6 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
       description: 'Flagship multimodal reasoning & coding assistant.',
     },
     {
-      id: 'gemini-3.8-flash',
-      label: 'Gemini 3.8 Flash',
-      provider: 'gemini',
-      category: 'chat',
-      tier: 'gemini',
-      enabled: true,
-      available: true,
-      inputUsdPer1M: 0.3,
-      outputUsdPer1M: 2.5,
-      baseCreditCost: 2,
-      creditsPer1kTokens: 1,
-      description: 'High-speed multimodal reasoning, PDF & grounded search.',
-    },
-    {
       id: 'gemini-3.1-flash-lite',
       label: 'Gemini 3.1 Flash-Lite',
       provider: 'gemini',
@@ -112,6 +99,20 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
       creditsPer1kTokens: 1,
       description: 'Economical low-latency assistant.',
     },
+    {
+      id: 'gemini-3.8-flash',
+      label: 'Gemini 3.8 Flash',
+      provider: 'gemini',
+      category: 'chat',
+      tier: 'gemini',
+      enabled: true,
+      available: true,
+      inputUsdPer1M: 0.3,
+      outputUsdPer1M: 2.5,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'High-speed multimodal reasoning, PDF & grounded search.',
+    },
   ],
 };
 
@@ -123,7 +124,7 @@ const FALLBACK_PACKAGES: RechargePackageDTO[] = [
 ];
 
 const FALLBACK_CAPABILITIES: ProviderCapabilitiesDTO = {
-  openaiConfigured: false,
+  openaiConfigured: true,
   openaiLiveVerified: false,
   geminiConfigured: true,
   geminiBridgeConfigured: true,
@@ -157,10 +158,12 @@ function QaagaAppShell() {
     config: PlatformConfigDTO;
     packages: RechargePackageDTO[];
     capabilities: ProviderCapabilitiesDTO;
+    defaultOpenAIModel: string;
   }>({
     config: FALLBACK_PUBLIC_CONFIG,
     packages: FALLBACK_PACKAGES,
     capabilities: FALLBACK_CAPABILITIES,
+    defaultOpenAIModel: 'gpt-4o-mini',
   });
   const [guestTheme, setGuestTheme] = useState<'light' | 'dark'>('light');
   const [guestMessages, setGuestMessages] = useState<ChatMessageDTO[]>([]);
@@ -175,6 +178,8 @@ function QaagaAppShell() {
   // Navigation & Progressive Gate Modals
   const [portalMode, setPortalMode] = useState<'admin' | 'user'>('user');
   const [activeNav, setActiveNav] = useState<NavSection>('chat');
+  const [workspaceTab, setWorkspaceTab] = useState<'chat' | 'work'>('work');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [adminGlobalSearch, setAdminGlobalSearch] = useState('');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -205,20 +210,19 @@ function QaagaAppShell() {
   } | null>(null);
   const initializedForUserIdRef = useRef<number | null>(null);
 
-  // Active Chat State
+  // Active Chat State (Defaults to server-configurable OpenAI model; never falls back silently to Gemini)
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [selectedModelId, setSelectedModelId] = useState<string>(
-    'gemini-3.1-flash-lite'
-  );
+  const [selectedModelId, setSelectedModelId] = useState<string>('gpt-4o-mini');
   const [reasoningEffort, setReasoningEffort] = useState<
     'low' | 'medium' | 'high'
-  >('medium');
+  >('low');
   const [chatInput, setChatInput] = useState('');
   const [webSearchEnabled, setWebSearchEnabled] = useState(false);
   const [uploads, setUploads] = useState<LocalUploadFile[]>([]);
   const [streamingText, setStreamingText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [missingOpenAISecret, setMissingOpenAISecret] = useState(false);
 
   // Audio Playback State
   const [speakingMessageId, setSpeakingMessageId] = useState<number | null>(
@@ -226,39 +230,54 @@ function QaagaAppShell() {
   );
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
 
+  const loadFrontpageMeta = useCallback(async () => {
+    try {
+      const r = await fetch('/api/public/frontpage');
+      if (!r.ok) return null;
+      const data = await r.json();
+      if (data && data.config && data.packages) {
+        const caps: ProviderCapabilitiesDTO =
+          data.capabilities || FALLBACK_CAPABILITIES;
+        const serverModel = String(
+          data.defaultOpenAIModel || 'gpt-4o-mini'
+        ).trim();
+        setPublicMeta({
+          config: data.config,
+          packages: data.packages,
+          capabilities: caps,
+          defaultOpenAIModel: serverModel,
+        });
+        setMissingOpenAISecret(!caps.openaiConfigured);
+
+        const enabledModels = (data.config as PlatformConfigDTO).models.filter(
+          (m) => m.enabled
+        );
+        const preferredOpenAI =
+          enabledModels.find(
+            (m) => m.id === serverModel && m.provider === 'openai'
+          ) ||
+          enabledModels.find((m) => m.provider === 'openai') ||
+          enabledModels[0];
+
+        if (preferredOpenAI) {
+          setSelectedModelId((prev) =>
+            enabledModels.some((m) => m.id === prev)
+              ? prev
+              : preferredOpenAI.id
+          );
+        }
+        return data;
+      }
+    } catch {
+      // Fallback config stays active
+    }
+    return null;
+  }, []);
+
   // Load public front page configuration on initial website visit
   useEffect(() => {
-    let cancelled = false;
-    fetch('/api/public/frontpage')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (!cancelled && data && data.config && data.packages) {
-          setPublicMeta({
-            config: data.config,
-            packages: data.packages,
-            capabilities: data.capabilities || FALLBACK_CAPABILITIES,
-          });
-          const liveModels = (
-            data.config as PlatformConfigDTO
-          ).models.filter((m) => m.enabled && m.available !== false);
-          if (liveModels.length > 0) {
-            const preferredFast =
-              liveModels.find((m) => m.id === 'gpt-4o-mini') ||
-              liveModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
-              liveModels[0];
-            setSelectedModelId((prev) =>
-              liveModels.some((m) => m.id === prev) ? prev : preferredFast.id
-            );
-          }
-        }
-      })
-      .catch(() => {
-        // Fallback config stays active
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void loadFrontpageMeta();
+  }, [loadFrontpageMeta]);
 
   // Sync dark mode class on document root
   useEffect(() => {
@@ -347,23 +366,30 @@ function QaagaAppShell() {
       const payload = data as WorkspacePayload;
       setWorkspace(payload);
       setUser(payload.user);
+      setMissingOpenAISecret(!payload.capabilities.openaiConfigured);
       setSelectedModelId((prev) => {
-        const liveEnabled = payload.config.models.filter(
-          (m) => m.enabled && m.available !== false
-        );
-        const candidates =
-          liveEnabled.length > 0
-            ? liveEnabled
-            : payload.config.models.filter((m) => m.enabled);
-        if (candidates.some((m) => m.id === prev)) return prev;
-        if (candidates.some((m) => m.id === payload.user.preferredModel)) {
+        const enabled = payload.config.models.filter((m) => m.enabled);
+        const serverModel = payload.defaultOpenAIModel || 'gpt-4o-mini';
+        if (enabled.some((m) => m.id === prev)) return prev;
+        if (
+          enabled.some(
+            (m) =>
+              m.id === payload.user.preferredModel && m.provider === 'openai'
+          )
+        ) {
           return payload.user.preferredModel;
         }
-        return candidates[0]?.id || 'gemini-3.8-flash';
+        const openAiDefault =
+          enabled.find(
+            (m) => m.id === serverModel && m.provider === 'openai'
+          ) ||
+          enabled.find((m) => m.provider === 'openai') ||
+          enabled[0];
+        return openAiDefault?.id || serverModel;
       });
 
       if (payload.user.role === 'admin' && payload.user.status === 'ACTIVE') {
-        await fetchAdminDashboard();
+        void fetchAdminDashboard();
       }
       return payload;
     } catch (err: unknown) {
@@ -513,174 +539,50 @@ function QaagaAppShell() {
       notifications: [],
       config: publicMeta.config,
       capabilities: publicMeta.capabilities,
+      defaultOpenAIModel: publicMeta.defaultOpenAIModel,
     }),
     [guestSession, guestTheme, publicMeta, selectedModelId]
   );
 
-  // Guest Free Text Chat Executor (POST /api/public/chat/stream)
+  const handleRefreshOpenAISecretStatus = useCallback(async () => {
+    setStreamError(null);
+    await loadFrontpageMeta();
+    if (token) {
+      await fetchWorkspace();
+    }
+  }, [fetchWorkspace, loadFrontpageMeta, token]);
+
+  // Unauthenticated Chat Submit Handler — POST /api/chat is protected by user authentication
   const executeGuestStreamChat = async (opts?: {
     customPrompt?: string;
     regenerateLast?: boolean;
   }) => {
-    let promptToSend =
-      opts?.customPrompt !== undefined ? opts.customPrompt : chatInput;
+    const promptToSend = (
+      opts?.customPrompt !== undefined ? opts.customPrompt : chatInput
+    ).trim();
 
-    let historySnapshot = guestMessages;
+    if (!promptToSend) return;
 
-    if (opts?.regenerateLast) {
-      const reversedUserIdx = [...guestMessages]
-        .reverse()
-        .findIndex((m) => m.role === 'user');
-      if (reversedUserIdx === -1) return;
-      const lastUserIdx = guestMessages.length - 1 - reversedUserIdx;
-      promptToSend = guestMessages[lastUserIdx].content;
-      historySnapshot = guestMessages.slice(0, lastUserIdx);
+    if (opts?.customPrompt !== undefined) {
+      setChatInput(promptToSend);
     }
 
-    if (!promptToSend.trim()) return;
+    if (!publicMeta.capabilities.openaiConfigured) {
+      setMissingOpenAISecret(true);
+      setStreamError(
+        'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to start chatting.'
+      );
+      return;
+    }
 
-    // Client-side guard: non-chat commands require login
     const detected = detectNonChatCommand(promptToSend);
     if (detected.isNonChat || webSearchEnabled || uploads.length > 0) {
       openLoginModal(detected.label, detected.targetNav);
       return;
     }
 
-    const userMsg: ChatMessageDTO = {
-      id: Date.now(),
-      sessionId: -1,
-      role: 'user',
-      content: promptToSend.trim(),
-      model: selectedModelId,
-      mode: 'chat',
-      attachments: [],
-      citations: [],
-      imageDataUrl: null,
-      creditsCharged: 0,
-      tokensUsed: 0,
-      createdAt: new Date().toISOString(),
-    };
-
-    const updatedHistory = [...historySnapshot, userMsg];
-    setGuestMessages(updatedHistory);
-    if (opts?.customPrompt === undefined && !opts?.regenerateLast) {
-      setChatInput('');
-    }
-
-    setIsStreaming(true);
-    setStreamingText('');
-    setStreamError(null);
-
-    let finalReplyText = '';
-
-    try {
-      const res = await fetch('/api/public/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: promptToSend.trim(),
-          modelId: selectedModelId,
-          reasoningEffort,
-          webSearch: false,
-          attachments: [],
-          history: historySnapshot.slice(-10).map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
-
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        if (res.status === 401 || errJson.code === 'LOGIN_REQUIRED') {
-          setGuestMessages(historySnapshot);
-          setChatInput(promptToSend);
-          openLoginModal('Advanced AI Command', 'chat');
-          return;
-        }
-        throw new Error(errJson.error || 'Guest chat request failed.');
-      }
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error('Streaming unavailable.');
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      const processGuestFrame = (frame: string) => {
-        const line = frame
-          .split('\n')
-          .find((l) => l.startsWith('data: '));
-        if (!line) return;
-
-        let event: { type?: string; text?: string; error?: string } | null = null;
-        try {
-          event = JSON.parse(line.slice(6));
-        } catch {
-          return;
-        }
-        if (!event) return;
-
-        if (event.type === 'delta' && event.text) {
-          finalReplyText += String(event.text);
-          setStreamingText(finalReplyText);
-        } else if (event.type === 'error') {
-          throw new Error(event.error || 'Guest chat streaming error.');
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim()) {
-            for (const trailing of buffer.split('\n\n')) {
-              processGuestFrame(trailing);
-            }
-          }
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop() || '';
-
-        for (const frame of parts) {
-          processGuestFrame(frame);
-        }
-      }
-
-      if (finalReplyText.trim()) {
-        const assistantMsg: ChatMessageDTO = {
-          id: Date.now() + 1,
-          sessionId: -1,
-          role: 'assistant',
-          content: finalReplyText,
-          model: selectedModelId,
-          mode: 'chat',
-          attachments: [],
-          citations: [],
-          imageDataUrl: null,
-          creditsCharged: 0,
-          tokensUsed: 0,
-          createdAt: new Date().toISOString(),
-        };
-        setGuestMessages((prev) => [...prev, assistantMsg]);
-      } else {
-        throw new Error('Empty response received. Please try sending your message again.');
-      }
-    } catch (err: unknown) {
-      if (!finalReplyText.trim()) {
-        setGuestMessages(historySnapshot);
-        setChatInput(promptToSend);
-      }
-      setStreamError(
-        err instanceof Error ? err.message : 'Guest chat interrupted.'
-      );
-    } finally {
-      setIsStreaming(false);
-      setStreamingText('');
-    }
+    // POST /api/chat is protected by user authentication & per-user rate limits
+    openLoginModal('OpenAI Chat', 'chat');
   };
 
   // Suspended Account Gate (Only SUSPENDED accounts are locked out; PENDING/0-credit accounts enter workspace & see Recharge prompt on commands)
@@ -873,6 +775,29 @@ function QaagaAppShell() {
       return;
     }
 
+    const priorSessionMessages = (activeSession?.messages || [])
+      .slice(-16)
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+    const selectedModelMeta = effectiveWorkspace.config.models.find(
+      (m) => m.id === selectedModelId
+    );
+    const isExplicitGeminiModel = selectedModelMeta?.provider === 'gemini';
+
+    if (
+      !isExplicitGeminiModel &&
+      !effectiveWorkspace.capabilities.openaiConfigured
+    ) {
+      setMissingOpenAISecret(true);
+      setStreamError(
+        'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to send OpenAI chat messages.'
+      );
+      return;
+    }
+
     setIsStreaming(true);
     setStreamingText('');
     setStreamError(null);
@@ -884,19 +809,131 @@ function QaagaAppShell() {
       setUploads([]);
     }
 
+    const nowIso = new Date().toISOString();
+    const tempSessionId = activeSessionId ?? -Date.now();
+    const tempUserMsgId = -Date.now() - 1;
+    const modeTag = attachmentsToSend.some((a) => !a.mimeType.startsWith('image/'))
+      ? 'pdf'
+      : attachmentsToSend.some((a) => a.mimeType.startsWith('image/'))
+      ? 'image'
+      : useSearch
+      ? 'search'
+      : 'chat';
+
+    const rollbackOptimisticUserMessage = () => {
+      if (opts?.regenerateLast) return;
+      setWorkspace((prev) => {
+        if (!prev) return prev;
+        if (tempSessionId < 0) {
+          return {
+            ...prev,
+            sessions: prev.sessions.filter((s) => s.id !== tempSessionId),
+          };
+        }
+        return {
+          ...prev,
+          sessions: prev.sessions.map((s) =>
+            s.id === tempSessionId
+              ? {
+                  ...s,
+                  messages: (s.messages || []).filter(
+                    (m) => m.id !== tempUserMsgId
+                  ),
+                }
+              : s
+          ),
+        };
+      });
+      if (tempSessionId < 0) {
+        setActiveSessionId(null);
+      }
+      if (opts?.customPrompt === undefined && promptToSend) {
+        setChatInput(promptToSend);
+      }
+    };
+
+    if (!opts?.regenerateLast) {
+      const optimisticUserMsg: ChatMessageDTO = {
+        id: tempUserMsgId,
+        sessionId: tempSessionId,
+        role: 'user',
+        content:
+          promptToSend.trim() ||
+          `Analyze attached file: ${attachmentsToSend[0]?.name || 'file'}`,
+        model: selectedModelId,
+        mode: modeTag,
+        attachments: attachmentsToSend.map((a) => ({
+          name: a.name,
+          mimeType: a.mimeType,
+          sizeBytes: a.sizeBytes,
+          previewDataUrl: a.previewDataUrl,
+        })),
+        citations: [],
+        imageDataUrl: null,
+        creditsCharged: 0,
+        tokensUsed: 0,
+        createdAt: nowIso,
+      };
+
+      setWorkspace((prev) => {
+        if (!prev) return prev;
+        if (activeSessionId && prev.sessions.some((s) => s.id === activeSessionId)) {
+          return {
+            ...prev,
+            sessions: prev.sessions.map((s) =>
+              s.id === activeSessionId
+                ? {
+                    ...s,
+                    updatedAt: nowIso,
+                    messages: [...(s.messages || []), optimisticUserMsg],
+                  }
+                : s
+            ),
+          };
+        }
+        const optimisticSession: ChatSessionDTO = {
+          id: tempSessionId,
+          title: (
+            promptToSend.trim() ||
+            attachmentsToSend[0]?.name ||
+            'New Conversation'
+          ).slice(0, 60),
+          model: selectedModelId,
+          mode: modeTag,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          messages: [optimisticUserMsg],
+        };
+        return {
+          ...prev,
+          sessions: [optimisticSession, ...prev.sessions],
+        };
+      });
+
+      if (!activeSessionId) {
+        setActiveSessionId(tempSessionId);
+      }
+    }
+
     let finalReplyText = '';
-    let resolvedSessionId = activeSessionId;
+    let resolvedSessionId = activeSessionId ?? tempSessionId;
+
+    // Route OpenAI chat directly to POST /api/chat (official OpenAI Responses API; never falls back to Gemini)
+    const targetEndpoint = isExplicitGeminiModel
+      ? '/api/chat/stream'
+      : '/api/chat';
 
     try {
-      const res = await authFetch('/api/chat/stream', {
+      const res = await authFetch(targetEndpoint, {
         method: 'POST',
         body: JSON.stringify({
-          sessionId: activeSessionId,
+          sessionId: activeSessionId && activeSessionId > 0 ? activeSessionId : null,
           prompt: promptToSend,
           modelId: selectedModelId,
           reasoningEffort,
           webSearch: useSearch,
           regenerateLast: Boolean(opts?.regenerateLast),
+          history: priorSessionMessages,
           attachments: attachmentsToSend.map((a) => ({
             name: a.name,
             mimeType: a.mimeType,
@@ -909,10 +946,21 @@ function QaagaAppShell() {
 
       if (!res.ok) {
         const errJson = await res.json().catch(() => ({}));
+        rollbackOptimisticUserMessage();
+        if (res.status === 401) {
+          openLoginModal('OpenAI Chat', 'chat');
+          return;
+        }
+        if (res.status === 503 && errJson.code === 'OPENAI_SECRET_MISSING') {
+          setMissingOpenAISecret(true);
+          setStreamError(
+            errJson.error ||
+              'OPENAI_API_KEY is missing on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets.'
+          );
+          return;
+        }
         if (res.status === 402 || errJson.code === 'RECHARGE_REQUIRED') {
-          if (opts?.customPrompt === undefined && !opts?.regenerateLast) {
-            setChatInput(promptToSend);
-          }
+          void fetchWorkspace();
           openRechargeModal(
             errJson.error ||
               'Insufficient credits or expired subscription. Please recharge to continue.'
@@ -937,6 +985,11 @@ function QaagaAppShell() {
         let event: {
           type?: string;
           sessionId?: number;
+          messageId?: number;
+          creditsCharged?: number;
+          tokensUsed?: number;
+          modelUsed?: string;
+          citations?: GroundingLink[];
           text?: string;
           error?: string;
         } | null = null;
@@ -948,16 +1001,82 @@ function QaagaAppShell() {
         if (!event) return;
 
         if (event.type === 'meta' && event.sessionId) {
-          resolvedSessionId = Number(event.sessionId);
-          setActiveSessionId(resolvedSessionId);
+          const realId = Number(event.sessionId);
+          resolvedSessionId = realId;
+          setActiveSessionId(realId);
+          if (tempSessionId < 0) {
+            setWorkspace((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    sessions: prev.sessions.map((s) =>
+                      s.id === tempSessionId
+                        ? {
+                            ...s,
+                            id: realId,
+                            messages: (s.messages || []).map((m) => ({
+                              ...m,
+                              sessionId: realId,
+                            })),
+                          }
+                        : s
+                    ),
+                  }
+                : prev
+            );
+          }
         } else if (event.type === 'delta' && event.text) {
           finalReplyText += String(event.text);
           setStreamingText(finalReplyText);
         } else if (event.type === 'error') {
           throw new Error(event.error || 'Provider streaming error.');
         } else if (event.type === 'done' && event.sessionId) {
-          resolvedSessionId = Number(event.sessionId);
-          setActiveSessionId(resolvedSessionId);
+          const realId = Number(event.sessionId);
+          resolvedSessionId = realId;
+          setActiveSessionId(realId);
+          const charged = Number(event.creditsCharged || 0);
+          const assistantMsg: ChatMessageDTO = {
+            id: Number(event.messageId || Date.now()),
+            sessionId: realId,
+            role: 'assistant',
+            content: finalReplyText || 'Completed.',
+            model: event.modelUsed || selectedModelId,
+            mode: modeTag,
+            attachments: [],
+            citations: Array.isArray(event.citations) ? event.citations : [],
+            imageDataUrl: null,
+            creditsCharged: charged,
+            tokensUsed: Number(event.tokensUsed || 0),
+            createdAt: new Date().toISOString(),
+          };
+
+          setWorkspace((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              credits: {
+                ...prev.credits,
+                remaining: Math.max(0, prev.credits.remaining - charged),
+                totalUsed: prev.credits.totalUsed + charged,
+                usedToday: prev.credits.usedToday + charged,
+              },
+              sessions: prev.sessions.map((s) => {
+                if (s.id !== realId && s.id !== tempSessionId) return s;
+                const baseMsgs = opts?.regenerateLast
+                  ? (s.messages || []).filter(
+                      (_, idx, arr) =>
+                        !(idx === arr.length - 1 && arr[idx].role === 'assistant')
+                    )
+                  : s.messages || [];
+                return {
+                  ...s,
+                  id: realId,
+                  updatedAt: assistantMsg.createdAt,
+                  messages: [...baseMsgs, assistantMsg],
+                };
+              }),
+            };
+          });
         }
       };
 
@@ -982,16 +1101,26 @@ function QaagaAppShell() {
         }
       }
 
-      await fetchWorkspace();
+      // Sync exact ledger & session metadata in the background without blocking input
+      void fetchWorkspace();
 
       if (opts?.speakReply && finalReplyText.trim()) {
-        await handleSpeakMessage(finalReplyText.slice(0, 1200), -1);
+        void handleSpeakMessage(finalReplyText.slice(0, 1200), -1);
       }
     } catch (err: unknown) {
-      setStreamError(
-        err instanceof Error ? err.message : 'Streaming interrupted.'
-      );
-      await fetchWorkspace();
+      if (!finalReplyText.trim()) {
+        rollbackOptimisticUserMessage();
+      }
+      const errMsg =
+        err instanceof Error ? err.message : 'Streaming interrupted.';
+      if (
+        errMsg.includes('OPENAI_API_KEY') ||
+        errMsg.includes('Invalid API Key')
+      ) {
+        setMissingOpenAISecret(true);
+      }
+      setStreamError(errMsg);
+      void fetchWorkspace();
     } finally {
       setIsStreaming(false);
       setStreamingText('');
@@ -1033,7 +1162,7 @@ function QaagaAppShell() {
       }
       throw new Error(data.error || 'Speech transcription failed.');
     }
-    await fetchWorkspace();
+    void fetchWorkspace();
     return String(data.transcript || '');
   };
 
@@ -1077,7 +1206,7 @@ function QaagaAppShell() {
       audio.onended = () => setSpeakingMessageId(null);
       audio.onerror = () => setSpeakingMessageId(null);
       await audio.play();
-      await fetchWorkspace();
+      void fetchWorkspace();
     } catch (err: unknown) {
       setSpeakingMessageId(null);
       setStreamError(
@@ -1312,11 +1441,27 @@ function QaagaAppShell() {
       : undefined;
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex bg-[#F6F8FA] dark:bg-[#0B1120] text-slate-900 dark:text-slate-100">
+    <div className="h-screen w-screen overflow-hidden flex bg-white dark:bg-[#0F1117] text-slate-900 dark:text-slate-100">
       <DarkNavySidebar
         user={effectiveWorkspace.user}
         credits={effectiveWorkspace.credits}
+        sessions={effectiveWorkspace.sessions}
+        activeSessionId={activeSessionId}
+        onSelectSession={(id) => {
+          setActiveSessionId(id);
+          setActiveNav('chat');
+        }}
+        onQuickPrompt={(prompt) => {
+          setActiveNav('chat');
+          if (isGuest) {
+            void executeGuestStreamChat({ customPrompt: prompt });
+          } else {
+            void executeAuthenticatedStreamChat({ customPrompt: prompt });
+          }
+        }}
         isGuest={isGuest}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
         activeNav={activeNav}
         onSelectNav={handleSelectNav}
         onNewChat={handleNewChat}
@@ -1332,9 +1477,14 @@ function QaagaAppShell() {
         <WorkspaceHeader
           workspace={effectiveWorkspace}
           isGuest={isGuest}
+          workspaceTab={workspaceTab}
+          onChangeWorkspaceTab={setWorkspaceTab}
+          sidebarCollapsed={sidebarCollapsed}
+          onExpandSidebar={() => setSidebarCollapsed(false)}
           selectedModelId={selectedModelId}
           onSelectModel={setSelectedModelId}
           onNavigate={handleSelectNav}
+          onToggleTheme={handleToggleTheme}
           onOpenLogin={openLoginModal}
           onLogout={logout}
           onMarkNotificationsRead={handleMarkNotificationsRead}
@@ -1346,13 +1496,17 @@ function QaagaAppShell() {
             <ChatWorkspaceView
               workspace={effectiveWorkspace}
               isGuest={isGuest}
+              workspaceTab={workspaceTab}
               activeSession={activeSession}
               selectedModelId={selectedModelId}
+              onSelectModel={setSelectedModelId}
               reasoningEffort={reasoningEffort}
               onChangeReasoningEffort={setReasoningEffort}
               streamingText={streamingText}
               isStreaming={isStreaming}
               streamError={streamError}
+              missingOpenAISecret={missingOpenAISecret}
+              onRefreshOpenAISecretStatus={handleRefreshOpenAISecretStatus}
               input={chatInput}
               onChangeInput={setChatInput}
               webSearch={webSearchEnabled}

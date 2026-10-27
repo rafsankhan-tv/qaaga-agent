@@ -27,10 +27,21 @@ import {
   Crown,
   Calendar,
   Zap,
+  Plus,
+  ChevronDown,
+  Folder,
+  BookOpen,
+  Compass,
+  Monitor,
+  ArrowUp,
+  AudioLines,
+  KeyRound,
+  RefreshCw,
 } from 'lucide-react';
 import type {
   ChatMessageDTO,
   ChatSessionDTO,
+  ModelConfigItem,
   NavSection,
   PaymentMethodType,
   WorkspacePayload,
@@ -104,13 +115,17 @@ export function detectNonChatCommand(prompt: string): {
 export function ChatWorkspaceView({
   workspace,
   isGuest = false,
+  workspaceTab = 'work',
   selectedModelId,
-  reasoningEffort = 'medium',
+  onSelectModel,
+  reasoningEffort = 'low',
   onChangeReasoningEffort,
   activeSession,
   streamingText,
   isStreaming,
   streamError,
+  missingOpenAISecret = false,
+  onRefreshOpenAISecretStatus,
   input,
   onChangeInput,
   webSearch,
@@ -130,13 +145,17 @@ export function ChatWorkspaceView({
 }: {
   workspace: WorkspacePayload;
   isGuest?: boolean;
+  workspaceTab?: 'chat' | 'work';
   selectedModelId?: string;
+  onSelectModel?: (id: string) => void;
   reasoningEffort?: 'low' | 'medium' | 'high';
   onChangeReasoningEffort?: (effort: 'low' | 'medium' | 'high') => void;
   activeSession: ChatSessionDTO | null;
   streamingText: string;
   isStreaming: boolean;
   streamError: string | null;
+  missingOpenAISecret?: boolean;
+  onRefreshOpenAISecretStatus?: () => Promise<void> | void;
   input: string;
   onChangeInput: (v: string) => void;
   webSearch: boolean;
@@ -157,12 +176,28 @@ export function ChatWorkspaceView({
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const modelMenuRef = useRef<HTMLDivElement>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [checkingSecret, setCheckingSecret] = useState(false);
+
+  useEffect(() => {
+    const onOutside = (e: MouseEvent) => {
+      if (
+        modelMenuRef.current &&
+        !modelMenuRef.current.contains(e.target as Node)
+      ) {
+        setModelPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onOutside);
+    return () => document.removeEventListener('mousedown', onOutside);
+  }, []);
 
   // Quick Recharge Panel state (Right Column)
   const activePackages = workspace.packages.filter((p) => p.active);
@@ -173,14 +208,35 @@ export function ChatWorkspaceView({
 
   const messages: ChatMessageDTO[] = activeSession?.messages || [];
 
+  const enabledModels: ModelConfigItem[] = workspace.config.models.filter(
+    (m) => m.enabled
+  );
+  const selectableModels = [
+    ...enabledModels.filter((m) => m.provider === 'openai'),
+    ...enabledModels.filter((m) => m.provider !== 'openai'),
+  ];
+
   const activeModelConfig =
-    workspace.config.models.find((m) => m.id === selectedModelId) ||
-    workspace.config.models.find((m) => m.enabled && m.available !== false) ||
+    selectableModels.find((m) => m.id === selectedModelId) ||
+    selectableModels.find((m) => m.id === workspace.defaultOpenAIModel) ||
+    selectableModels.find((m) => m.provider === 'openai') ||
+    selectableModels[0] ||
     workspace.config.models[0];
 
-  const supportsReasoningControl =
-    activeModelConfig?.tier === 'openai-reasoning' ||
-    activeModelConfig?.id === 'gemini-3.8-flash';
+  const showOpenAISecretSetup =
+    (activeModelConfig?.provider === 'openai' || !activeModelConfig) &&
+    (!workspace.capabilities.openaiConfigured || missingOpenAISecret);
+
+  const compactModelName = (activeModelConfig?.label || 'GPT-4o mini')
+    .replace(/\s*\(.*?\)\s*/g, '')
+    .trim();
+
+  const effortDisplay =
+    reasoningEffort === 'high'
+      ? 'High'
+      : reasoningEffort === 'medium'
+      ? 'Medium'
+      : 'Low';
 
   const conversationCreditsTotal = messages.reduce(
     (sum, m) => sum + (m.creditsCharged || 0),
@@ -210,8 +266,9 @@ export function ChatWorkspaceView({
       return;
     }
     if (
-      !workspace.user.isSubscriptionActive ||
-      workspace.credits.remaining < requiredCredits
+      requiredCredits > 0 &&
+      (!workspace.user.isSubscriptionActive ||
+        workspace.credits.remaining < requiredCredits)
     ) {
       onRequireRecharge(
         `Please recharge a 20, 50, 100, or 200 BDT plan to use ${featureLabel} (${requiredCredits} credits required, ${workspace.credits.remaining} available).`
@@ -292,6 +349,20 @@ export function ChatWorkspaceView({
     onAddUploads(arr);
   };
 
+  const openFilePickerGated = () => {
+    if (isGuest) {
+      onRequireLogin('File & PDF Upload', 'pdf-docs');
+      return;
+    }
+    if (usageBlocked) {
+      onRequireRecharge(
+        'Please recharge a 20, 50, 100, or 200 BDT plan to upload and analyze files.'
+      );
+      return;
+    }
+    fileRef.current?.click();
+  };
+
   const toggleMic = async () => {
     if (isGuest) {
       onRequireLogin('Voice Dictation & Speech', 'voice-studio');
@@ -350,10 +421,6 @@ export function ChatWorkspaceView({
     }
   };
 
-  const firstName = isGuest
-    ? 'Guest'
-    : workspace.user.fullName.split(' ')[0] || 'User';
-
   const usedPct =
     workspace.credits.totalGranted > 0
       ? Math.min(
@@ -373,711 +440,678 @@ export function ChatWorkspaceView({
       workspace.credits.byFeature.voice
   );
 
-  return (
-    <div className="h-full w-full flex overflow-hidden">
-      {/* CENTER COLUMN: Hero Greeting + 6 Tool Cards + Chat Stream + Composer */}
-      <div className="flex-1 min-w-0 flex flex-col h-full px-4 sm:px-7 py-4 overflow-hidden">
-        {/* Scrollable Hero / Messages Area */}
-        <div className="flex-1 overflow-y-auto pr-1 space-y-5">
-          {messages.length === 0 && !isStreaming ? (
-            <div className="max-w-3xl mx-auto py-3 sm:py-6 space-y-6">
-              {/* Top Greeting Banner */}
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-5">
-                <div className="space-y-2 max-w-xl">
-                  <h1 className="font-heading font-extrabold text-2xl sm:text-[34px] leading-[1.15] text-slate-900 dark:text-white tracking-tight">
-                    Hello,{' '}
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      {firstName}!
-                    </span>
-                    <br />
-                    How can I help you today?
-                  </h1>
-                  <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 leading-relaxed">
-                    I can chat with you for free right here, or sign in to
-                    generate images, analyze PDF files, search the live web, and
-                    converse by voice.
-                  </p>
-                </div>
+  const hasTypedContent = Boolean(input.trim() || uploads.length > 0);
 
-                {/* Brand Visual Accent */}
-                <div className="hidden sm:flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-2xs shrink-0">
-                  <QaagaLogo className="w-12 h-12" />
-                  <div className="text-[11px] leading-snug text-slate-500 dark:text-slate-400 font-medium">
-                    <div className="font-heading font-bold text-slate-900 dark:text-white text-xs">
-                      All-in-One AI
+  const renderComposerCard = (opts: { showBottomTray: boolean; dropUp?: boolean }) => (
+    <div className="w-full max-w-[680px] mx-auto">
+      <input
+        ref={fileRef}
+        type="file"
+        multiple
+        accept=".pdf,image/*,.txt,.csv,.md,.json"
+        onChange={(e) => {
+          handleFiles(e.target.files);
+          e.target.value = '';
+        }}
+        className="hidden"
+      />
+
+      {/* Main Rounded White Composer Box */}
+      <div className="relative z-10 rounded-[26px] bg-white dark:bg-[#161B26] border border-slate-200/90 dark:border-slate-700/90 px-5 pt-4 pb-3 shadow-[0_6px_32px_-8px_rgba(0,0,0,0.08)]">
+        {uploads.length > 0 && (
+          <div className="flex flex-wrap gap-2 mb-2.5 pb-2 border-b border-slate-100 dark:border-slate-800">
+            {uploads.map((u, idx) => (
+              <div
+                key={idx}
+                className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
+              >
+                <FileText className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="truncate max-w-[160px]">{u.name}</span>
+                <button
+                  type="button"
+                  onClick={() => onRemoveUpload(idx)}
+                  className="text-slate-400 hover:text-rose-500 cursor-pointer"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <textarea
+          ref={inputRef}
+          rows={2}
+          value={input}
+          onChange={(e) => onChangeInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              if (!isStreaming && hasTypedContent) {
+                handleSubmitPrompt();
+              }
+            }
+          }}
+          placeholder={
+            recording
+              ? 'Listening... click stop when done speaking'
+              : workspaceTab === 'work'
+              ? 'Work with QAAGA AGENT'
+              : 'Message QAAGA AGENT'
+          }
+          className="w-full min-h-[52px] resize-none bg-transparent text-[15px] leading-relaxed text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none"
+        />
+
+        {/* Composer Bottom Action Bar */}
+        <div className="flex items-center justify-between gap-2 pt-1.5">
+          {/* Left: + Attachment Trigger & Active Plugin State */}
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={openFilePickerGated}
+              className="w-8 h-8 rounded-full flex items-center justify-center text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+              title="Attach PDF, document, or image"
+              aria-label="Attach file"
+            >
+              <Plus className="w-5 h-5 stroke-[1.9]" />
+            </button>
+
+            {webSearch && !isGuest && (
+              <button
+                type="button"
+                onClick={onToggleWebSearch}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300 text-xs font-medium cursor-pointer"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                <span>Search on</span>
+              </button>
+            )}
+          </div>
+
+          {/* Right: Inline Model + Effort Selector, Mic, and Blue Waveform/Send Circle */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <div className="relative" ref={modelMenuRef}>
+              <button
+                type="button"
+                onClick={() => setModelPickerOpen((o) => !o)}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 text-[13px] transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <span className="font-medium text-slate-900 dark:text-slate-100 max-w-[140px] truncate">
+                  {compactModelName}
+                </span>
+                <span className="text-slate-400 dark:text-slate-500">
+                  {effortDisplay}
+                </span>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              </button>
+
+              {modelPickerOpen && (
+                <div
+                  className={`absolute right-0 ${
+                    opts.dropUp ? 'bottom-full mb-2' : 'top-full mt-2'
+                  } w-76 max-h-[340px] overflow-y-auto rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl p-2 z-50 text-left`}
+                >
+                  {onChangeReasoningEffort && (
+                    <div className="px-2.5 pt-1 pb-2 mb-1.5 border-b border-slate-100 dark:border-slate-800">
+                      <div className="text-[11px] font-medium text-slate-400 mb-1.5">
+                        Thinking effort
+                      </div>
+                      <div className="grid grid-cols-3 gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-slate-800">
+                        {(['low', 'medium', 'high'] as const).map((eff) => (
+                          <button
+                            key={eff}
+                            type="button"
+                            onClick={() => onChangeReasoningEffort(eff)}
+                            className={`py-1 rounded-lg text-xs font-medium capitalize transition-colors cursor-pointer ${
+                              reasoningEffort === eff
+                                ? 'bg-white dark:bg-slate-950 text-slate-900 dark:text-white shadow-2xs'
+                                : 'text-slate-500 hover:text-slate-900 dark:hover:text-white'
+                            }`}
+                          >
+                            {eff}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    <div>Ideas · Answers</div>
-                    <div>Creativity · Productivity</div>
-                  </div>
-                </div>
-              </div>
+                  )}
 
-              {/* 6 Interactive Tool Cards (Matches QAAGA AGENT Front Page Design) */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
-                {/* 1. Chat (Free on Front Page) */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!isGuest && usageBlocked) {
-                      onRequireRecharge(
-                        'Please recharge a BDT package to continue running AI commands on your account.'
+                  <div className="px-2.5 py-1 text-[11px] font-medium text-slate-400">
+                    Available models
+                  </div>
+                  <div className="space-y-0.5">
+                    {selectableModels.map((m) => {
+                      const selected = m.id === activeModelConfig?.id;
+                      return (
+                        <button
+                          key={m.id}
+                          type="button"
+                          onClick={() => {
+                            onSelectModel?.(m.id);
+                            setModelPickerOpen(false);
+                          }}
+                          className={`w-full text-left px-2.5 py-2 rounded-xl flex items-center justify-between gap-2 transition-colors cursor-pointer ${
+                            selected
+                              ? 'bg-slate-100 dark:bg-slate-800'
+                              : 'hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="text-[13px] font-medium text-slate-900 dark:text-white truncate">
+                              {m.label}
+                            </p>
+                            <p className="text-[11px] text-slate-400 font-mono tabular-nums">
+                              {m.baseCreditCost} cr · {m.provider === 'openai' ? 'OpenAI' : 'Gemini'}
+                            </p>
+                          </div>
+                          {selected && (
+                            <Check className="w-4 h-4 text-slate-900 dark:text-white shrink-0" />
+                          )}
+                        </button>
                       );
-                      return;
-                    }
-                    inputRef.current?.focus();
-                  }}
-                  className="text-left p-4 rounded-2xl bg-emerald-50/65 dark:bg-slate-900 border border-emerald-100 dark:border-slate-800 hover:border-emerald-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-emerald-100 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-400 flex items-center justify-center">
-                    <MessageSquare className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>Chat</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Get answers, write, brainstorm and more with{' '}
-                    <strong className="text-slate-700 dark:text-slate-200">
-                      QAAGA AGENT
-                    </strong>
-                    .
-                  </p>
-                </button>
-
-                {/* 2. Generate Image (Requires Login -> Recharge) */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Image Generation',
-                      'image-studio',
-                      workspace.config.creditRates.imageGeneration
-                    )
-                  }
-                  className="text-left p-4 rounded-2xl bg-violet-50/55 dark:bg-slate-900 border border-violet-100 dark:border-slate-800 hover:border-violet-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-violet-100 dark:bg-violet-950/70 text-violet-700 dark:text-violet-400 flex items-center justify-center">
-                    <ImageIcon className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>Generate Image</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Create stunning images from your ideas.
-                  </p>
-                </button>
-
-                {/* 3. Analyze PDF (Requires Login -> Recharge) */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'PDF Analysis',
-                      'pdf-docs',
-                      workspace.config.creditRates.pdfAnalysis
-                    )
-                  }
-                  className="text-left p-4 rounded-2xl bg-rose-50/55 dark:bg-slate-900 border border-rose-100 dark:border-slate-800 hover:border-rose-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-rose-100 dark:bg-rose-950/70 text-rose-600 dark:text-rose-400 flex items-center justify-center">
-                    <FileText className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>Analyze PDF</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Upload and analyze PDF files instantly.
-                  </p>
-                </button>
-
-                {/* 4. Web Search (Requires Login -> Recharge) */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Live Web Search',
-                      'web-search',
-                      workspace.config.creditRates.webSearch,
-                      () => {
-                        if (!webSearch) onToggleWebSearch();
-                        inputRef.current?.focus();
-                      }
-                    )
-                  }
-                  className="text-left p-4 rounded-2xl bg-sky-50/60 dark:bg-slate-900 border border-sky-100 dark:border-slate-800 hover:border-sky-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-sky-100 dark:bg-sky-950/70 text-sky-600 dark:text-sky-400 flex items-center justify-center">
-                    <Globe className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>Web Search</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Get real-time information from the internet.
-                  </p>
-                </button>
-
-                {/* 5. Voice Chat (Requires Login -> Recharge) */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Voice Chat',
-                      'voice-studio',
-                      workspace.config.creditRates.voiceStt
-                    )
-                  }
-                  className="text-left p-4 rounded-2xl bg-amber-50/60 dark:bg-slate-900 border border-amber-100 dark:border-slate-800 hover:border-amber-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-amber-100 dark:bg-amber-950/70 text-amber-600 dark:text-amber-400 flex items-center justify-center">
-                    <Mic className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>Voice Chat</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Talk naturally with voice conversations.
-                  </p>
-                </button>
-
-                {/* 6. More Tools (Requires Login -> Recharge) */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Advanced AI Tools',
-                      'credit-dashboard',
-                      1
-                    )
-                  }
-                  className="text-left p-4 rounded-2xl bg-slate-100/75 dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 hover:border-slate-400 transition-colors cursor-pointer group"
-                >
-                  <div className="w-10 h-10 rounded-xl bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 flex items-center justify-center">
-                    <LayoutGrid className="w-5 h-5" />
-                  </div>
-                  <div className="mt-3.5 flex items-center gap-1.5 font-heading font-bold text-[15px] text-slate-900 dark:text-white">
-                    <span>More Tools</span>
-                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition-transform" />
-                  </div>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                    Explore all tools and advanced features.
-                  </p>
-                </button>
-              </div>
-
-              {/* 4 Quick Action Buttons Row */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-                <button
-                  type="button"
-                  onClick={() =>
-                    handleSubmitPrompt(
-                      'Give me 5 practical productivity tips and summarize how QAAGA AGENT can help with daily tasks.'
-                    )
-                  }
-                  className="px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-emerald-500 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 text-left cursor-pointer"
-                >
-                  <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span className="truncate">Summarize key ideas for me</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Image Generation',
-                      'image-studio',
-                      workspace.config.creditRates.imageGeneration
-                    )
-                  }
-                  className="px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-violet-500 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 text-left cursor-pointer"
-                >
-                  <ImageIcon className="w-3.5 h-3.5 text-violet-600 shrink-0" />
-                  <span className="truncate">Create an image of a sunset</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'PDF Analysis',
-                      'pdf-docs',
-                      workspace.config.creditRates.pdfAnalysis
-                    )
-                  }
-                  className="px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-rose-500 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 text-left cursor-pointer"
-                >
-                  <FileText className="w-3.5 h-3.5 text-rose-500 shrink-0" />
-                  <span className="truncate">Analyze this PDF file</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Live Web Search',
-                      'web-search',
-                      workspace.config.creditRates.webSearch,
-                      () =>
-                        handleSubmitPrompt(
-                          'Search and summarize the latest AI technology breakthroughs today.',
-                          true
-                        )
-                    )
-                  }
-                  className="px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-sky-500 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2 text-left cursor-pointer"
-                >
-                  <Globe className="w-3.5 h-3.5 text-sky-600 shrink-0" />
-                  <span className="truncate">Search latest AI news</span>
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="max-w-3xl mx-auto space-y-5 py-2">
-              {!isGuest && activeSession && (
-                <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                  <span className="font-semibold text-slate-700 dark:text-slate-200 truncate max-w-xs">
-                    {activeSession.title}
-                  </span>
-                  <div className="flex items-center gap-3 font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
-                    <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
-                      Conversation: {conversationCreditsTotal} cr used
-                    </span>
-                    <span>·</span>
-                    <span>{conversationTokensTotal.toLocaleString()} tokens</span>
+                    })}
                   </div>
                 </div>
               )}
-
-              {messages.map((msg, idx) => {
-                const isUser = msg.role === 'user';
-                const isLastAssistant =
-                  !isUser && idx === messages.length - 1 && !isStreaming;
-
-                return (
-                  <div
-                    key={msg.id}
-                    className={`flex items-start gap-3.5 ${
-                      isUser ? 'justify-end' : 'justify-start'
-                    }`}
-                  >
-                    {!isUser && (
-                      <QaagaLogo className="w-8 h-8 shrink-0 mt-0.5" />
-                    )}
-
-                    <div
-                      className={`max-w-[85%] rounded-2xl px-4 py-3.5 ${
-                        isUser
-                          ? 'bg-emerald-600 text-white'
-                          : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100'
-                      }`}
-                    >
-                      {msg.attachments && msg.attachments.length > 0 && (
-                        <div className="flex flex-wrap gap-2 mb-2">
-                          {msg.attachments.map((att, i) => (
-                            <div
-                              key={i}
-                              className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg bg-black/15"
-                            >
-                              {att.previewDataUrl ? (
-                                <img
-                                  src={att.previewDataUrl}
-                                  alt={att.name}
-                                  referrerPolicy="no-referrer"
-                                  className="w-6 h-6 rounded object-cover"
-                                />
-                              ) : (
-                                <FileText className="w-3.5 h-3.5" />
-                              )}
-                              <span className="truncate max-w-[160px]">
-                                {att.name}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {msg.imageDataUrl && (
-                        <div className="mb-3 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
-                          <img
-                            src={msg.imageDataUrl}
-                            alt={msg.content}
-                            referrerPolicy="no-referrer"
-                            className="w-full max-w-md h-auto block"
-                          />
-                        </div>
-                      )}
-
-                      {isUser ? (
-                        <p className="text-sm whitespace-pre-wrap leading-relaxed">
-                          {msg.content}
-                        </p>
-                      ) : (
-                        <div className="qaaga-markdown text-sm">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                            {msg.content}
-                          </ReactMarkdown>
-                        </div>
-                      )}
-
-                      {!isUser && msg.citations && msg.citations.length > 0 && (
-                        <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-2">
-                          {msg.citations.map((cit, i) => (
-                            <a
-                              key={i}
-                              href={cit.uri}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 hover:underline"
-                            >
-                              <ExternalLink className="w-3 h-3" />
-                              <span className="truncate max-w-[190px]">
-                                {cit.title}
-                              </span>
-                            </a>
-                          ))}
-                        </div>
-                      )}
-
-                      {!isUser && (
-                        <div className="mt-3 pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-[11px] text-slate-400">
-                          <div className="flex items-center gap-1.5 font-mono tabular-nums">
-                            <span>{msg.model || 'qaaga'}</span>
-                            <span aria-hidden="true">·</span>
-                            <span>
-                              {isGuest ? 'Free Chat' : `${msg.creditsCharged} cr`}
-                            </span>
-                            {msg.tokensUsed > 0 && (
-                              <>
-                                <span aria-hidden="true">·</span>
-                                <span>{msg.tokensUsed} tok</span>
-                              </>
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-2.5">
-                            {workspace.capabilities.features.textToSpeech
-                              .available && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (isGuest) {
-                                    onRequireLogin(
-                                      'Voice Read-Aloud (TTS)',
-                                      'voice-studio'
-                                    );
-                                    return;
-                                  }
-                                  if (usageBlocked) {
-                                    onRequireRecharge(
-                                      'Please recharge your account to use neural Text-to-Speech.'
-                                    );
-                                    return;
-                                  }
-                                  onSpeak(msg.content, msg.id);
-                                }}
-                                className="flex items-center gap-1 hover:text-emerald-600 cursor-pointer"
-                              >
-                                {speakingId === msg.id ? (
-                                  <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />
-                                ) : (
-                                  <Volume2 className="w-3.5 h-3.5" />
-                                )}
-                                <span>Listen</span>
-                              </button>
-                            )}
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                navigator.clipboard.writeText(msg.content);
-                                setCopiedId(msg.id);
-                                setTimeout(() => setCopiedId(null), 1600);
-                              }}
-                              className="flex items-center gap-1 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
-                            >
-                              {copiedId === msg.id ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                              <span>
-                                {copiedId === msg.id ? 'Copied' : 'Copy'}
-                              </span>
-                            </button>
-
-                            {isLastAssistant && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  if (!isGuest && usageBlocked) {
-                                    onRequireRecharge(
-                                      'Please recharge your account to regenerate responses.'
-                                    );
-                                    return;
-                                  }
-                                  onRegenerate();
-                                }}
-                                className="flex items-center gap-1 hover:text-emerald-600 cursor-pointer"
-                              >
-                                <RotateCcw className="w-3.5 h-3.5" />
-                                <span>Regenerate</span>
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    {isUser && (
-                      <UserAvatarBadge
-                        name={isGuest ? 'Guest' : workspace.user.fullName}
-                        role={workspace.user.role}
-                        className="w-8 h-8 mt-0.5"
-                      />
-                    )}
-                  </div>
-                );
-              })}
             </div>
-          )}
 
-          {isStreaming && (
-            <div className="max-w-3xl mx-auto flex items-start gap-3.5">
-              <QaagaLogo className="w-8 h-8 shrink-0 mt-0.5" />
-              <div className="max-w-[85%] rounded-2xl px-4 py-3.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-800 dark:text-slate-100">
-                {streamingText ? (
-                  <div className="qaaga-markdown text-sm">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {streamingText}
-                    </ReactMarkdown>
-                  </div>
+            {workspace.capabilities.features.speechToText.available && (
+              <button
+                type="button"
+                disabled={transcribing}
+                onClick={toggleMic}
+                className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors cursor-pointer ${
+                  recording
+                    ? 'bg-rose-50 text-rose-600'
+                    : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                }`}
+                title="Voice dictation"
+                aria-label="Voice dictation"
+              >
+                {transcribing ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                ) : recording ? (
+                  <Square className="w-3.5 h-3.5 fill-current" />
                 ) : (
-                  <div className="flex items-center gap-2 text-xs text-slate-500">
-                    <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
-                    <span>QAAGA AGENT is thinking...</span>
-                  </div>
+                  <Mic className="w-[18px] h-[18px]" />
                 )}
-              </div>
-            </div>
-          )}
-
-          {streamError && (
-            <div className="max-w-3xl mx-auto rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 px-4 py-3 text-xs text-rose-700 dark:text-rose-300">
-              {streamError}
-            </div>
-          )}
-
-          <div ref={endRef} />
-        </div>
-
-        {/* Bottom Chat & Command Composer */}
-        <div className="pt-3 shrink-0 max-w-3xl mx-auto w-full">
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3 shadow-xs">
-            {uploads.length > 0 && (
-              <div className="flex flex-wrap gap-2 mb-2.5 pb-2 border-b border-slate-100 dark:border-slate-800">
-                {uploads.map((u, idx) => (
-                  <div
-                    key={idx}
-                    className="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-xs text-slate-700 dark:text-slate-200"
-                  >
-                    <FileText className="w-3.5 h-3.5 text-emerald-600" />
-                    <span className="truncate max-w-[150px]">{u.name}</span>
-                    <button
-                      type="button"
-                      onClick={() => onRemoveUpload(idx)}
-                      className="text-slate-400 hover:text-rose-500 cursor-pointer"
-                    >
-                      ×
-                    </button>
-                  </div>
-                ))}
-              </div>
+              </button>
             )}
 
-            <textarea
-              ref={inputRef}
-              rows={2}
-              value={input}
-              onChange={(e) => onChangeInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!isStreaming && (input.trim() || uploads.length > 0)) {
-                    handleSubmitPrompt();
-                  }
+            <button
+              type="button"
+              disabled={isStreaming}
+              onClick={() => {
+                if (hasTypedContent) {
+                  handleSubmitPrompt();
+                } else {
+                  guardFeatureAccess(
+                    'Voice Chat',
+                    'voice-studio',
+                    workspace.config.creditRates.voiceStt
+                  );
                 }
               }}
-              placeholder={
-                recording
-                  ? 'Listening... click stop when done speaking'
-                  : 'Type your message here...'
-              }
-              className="w-full resize-none bg-transparent text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none"
-            />
-
-            <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-              <div className="flex items-center gap-2 flex-wrap">
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  accept=".pdf,image/*,.txt,.csv,.md,.json"
-                  onChange={(e) => {
-                    handleFiles(e.target.files);
-                    e.target.value = '';
-                  }}
-                  className="hidden"
-                />
-
-                {/* Upload PDF/File */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (isGuest) {
-                      onRequireLogin('File & PDF Upload', 'pdf-docs');
-                      return;
-                    }
-                    if (usageBlocked) {
-                      onRequireRecharge(
-                        'Please recharge a 20, 50, 100, or 200 BDT plan to upload and analyze files.'
-                      );
-                      return;
-                    }
-                    fileRef.current?.click();
-                  }}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
-                >
-                  <Paperclip className="w-3.5 h-3.5" />
-                  <span>Upload</span>
-                </button>
-
-                {/* Web Search Switch */}
-                {workspace.capabilities.features.webSearch.available && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (isGuest) {
-                        onRequireLogin('Live Web Search', 'web-search');
-                        return;
-                      }
-                      if (usageBlocked) {
-                        onRequireRecharge(
-                          'Please recharge a 20, 50, 100, or 200 BDT plan to enable Live Web Search.'
-                        );
-                        return;
-                      }
-                      onToggleWebSearch();
-                    }}
-                    className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium border transition-colors cursor-pointer ${
-                      webSearch && !isGuest
-                        ? 'border-emerald-500/50 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
-                        : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400'
-                    }`}
-                  >
-                    <Globe className="w-3.5 h-3.5" />
-                    <span>Web Search</span>
-                    <span
-                      className={`w-6 h-3.5 rounded-full inline-flex items-center px-0.5 transition-colors ${
-                        webSearch && !isGuest
-                          ? 'bg-emerald-600 justify-end'
-                          : 'bg-slate-300 dark:bg-slate-700 justify-start'
-                      }`}
-                    >
-                      <span className="w-2.5 h-2.5 rounded-full bg-white" />
-                    </span>
-                  </button>
-                )}
-
-                {/* Image Tool Button */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    guardFeatureAccess(
-                      'Image Generation',
-                      'image-studio',
-                      workspace.config.creditRates.imageGeneration
-                    )
-                  }
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
-                >
-                  <ImageIcon className="w-3.5 h-3.5" />
-                  <span>Image</span>
-                </button>
-
-                {/* Reasoning Effort Control (shown for Reasoning / Thinking models) */}
-                {supportsReasoningControl && onChangeReasoningEffort && (
-                  <div className="flex items-center gap-1 px-2 py-1 rounded-xl border border-slate-200 dark:border-slate-700 text-[11px]">
-                    <span className="text-slate-400 font-medium pl-0.5">
-                      Reasoning:
-                    </span>
-                    {(['low', 'medium', 'high'] as const).map((eff) => (
-                      <button
-                        key={eff}
-                        type="button"
-                        onClick={() => onChangeReasoningEffort(eff)}
-                        className={`px-1.5 py-0.5 rounded-md font-semibold capitalize cursor-pointer ${
-                          reasoningEffort === eff
-                            ? 'bg-emerald-600 text-white'
-                            : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-200'
-                        }`}
-                      >
-                        {eff === 'medium' ? 'Med' : eff}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2">
-                {workspace.capabilities.features.speechToText.available && (
-                  <button
-                    type="button"
-                    disabled={transcribing}
-                    onClick={toggleMic}
-                    className={`w-9 h-9 rounded-full border flex items-center justify-center cursor-pointer ${
-                      recording
-                        ? 'border-rose-400 bg-rose-50 text-rose-600'
-                        : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-                    }`}
-                    title="Voice Chat / Dictation"
-                  >
-                    {transcribing ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
-                    ) : recording ? (
-                      <Square className="w-3.5 h-3.5 fill-current" />
-                    ) : (
-                      <Mic className="w-4 h-4" />
-                    )}
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  disabled={
-                    isStreaming || (!input.trim() && uploads.length === 0)
-                  }
-                  onClick={() => handleSubmitPrompt()}
-                  className="w-9 h-9 rounded-full bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 text-white flex items-center justify-center cursor-pointer"
-                  aria-label="Send message"
-                >
-                  {isStreaming ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Send className="w-4 h-4" />
-                  )}
-                </button>
-              </div>
-            </div>
+              className="w-9 h-9 rounded-full bg-[#2563EB] hover:bg-[#1D4ED8] disabled:opacity-50 text-white flex items-center justify-center transition-colors shadow-xs cursor-pointer shrink-0"
+              title={hasTypedContent ? 'Send message' : 'Open Live Voice'}
+              aria-label={hasTypedContent ? 'Send message' : 'Open Live Voice'}
+            >
+              {isStreaming ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : hasTypedContent ? (
+                <ArrowUp className="w-[18px] h-[18px] stroke-[2.25]" />
+              ) : (
+                <AudioLines className="w-[18px] h-[18px]" />
+              )}
+            </button>
           </div>
         </div>
       </div>
 
-      {/* RIGHT SIDEBAR PANEL: Subscription, Credits, Quick Recharge & Usage (Desktop) */}
-      <aside className="hidden xl:flex w-[336px] shrink-0 flex-col h-full border-l border-slate-200/90 dark:border-slate-800 bg-white dark:bg-[#0D1425] overflow-y-auto p-4 space-y-4">
+      {/* Attached Bottom Action Tray (Displayed in Work mode empty hero) */}
+      {opts.showBottomTray && (
+        <div className="-mt-5 pt-7 pb-2.5 px-4 rounded-b-[22px] bg-[#F5F5F6] dark:bg-slate-900/90 border border-t-0 border-slate-200/75 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[12.5px] text-slate-600 dark:text-slate-300">
+          <div className="flex flex-wrap items-center gap-1 sm:gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                guardFeatureAccess('Project History', 'history', 0, () =>
+                  onNavigate('history')
+                )
+              }
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:text-slate-900 dark:hover:text-white transition-colors cursor-pointer"
+            >
+              <Folder className="w-3.5 h-3.5 text-slate-500" />
+              <span>Choose project</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={openFilePickerGated}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:text-slate-900 dark:hover:text-white transition-colors cursor-pointer"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-slate-500" />
+              <span>Files</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                guardFeatureAccess(
+                  'Live Web Search',
+                  'web-search',
+                  workspace.config.creditRates.webSearch,
+                  () => {
+                    onToggleWebSearch();
+                    inputRef.current?.focus();
+                  }
+                )
+              }
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg transition-colors cursor-pointer ${
+                webSearch && !isGuest
+                  ? 'bg-sky-100/80 dark:bg-sky-950/60 text-sky-800 dark:text-sky-300 font-medium'
+                  : 'hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:text-slate-900 dark:hover:text-white'
+              }`}
+            >
+              <Compass className="w-3.5 h-3.5 text-slate-500" />
+              <span>Plugins</span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={() =>
+              guardFeatureAccess(
+                'Image Generation',
+                'image-studio',
+                workspace.config.creditRates.imageGeneration
+              )
+            }
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg hover:bg-black/[0.05] dark:hover:bg-white/[0.06] hover:text-slate-900 dark:hover:text-white transition-colors cursor-pointer"
+          >
+            <Monitor className="w-3.5 h-3.5 text-slate-500" />
+            <span>Image studio</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  const renderOpenAISecretPrompt = () => {
+    if (!showOpenAISecretSetup) return null;
+    return (
+      <div className="rounded-2xl bg-amber-50/90 dark:bg-amber-950/35 border border-amber-200/90 dark:border-amber-800/80 p-4 text-left space-y-2.5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-300 flex items-center justify-center shrink-0 mt-0.5">
+              <KeyRound className="w-4 h-4" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="font-heading font-semibold text-xs sm:text-sm text-amber-950 dark:text-amber-100">
+                OpenAI API Secret Setup Required
+              </h3>
+              <p className="text-xs leading-relaxed text-amber-900/90 dark:text-amber-200/90">
+                <code className="font-mono font-semibold px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/70">
+                  OPENAI_API_KEY
+                </code>{' '}
+                {workspace.capabilities.openaiConfigured
+                  ? 'was rejected by OpenAI (HTTP 401 Invalid API Key).'
+                  : 'is missing on the server.'}{' '}
+                To connect live OpenAI Responses API chat securely without
+                exposing secrets in the browser:
+              </p>
+              <ol className="list-decimal list-inside text-[11.5px] leading-relaxed text-amber-900/85 dark:text-amber-200/85 space-y-0.5 pt-0.5">
+                <li>
+                  Open <strong>Settings → Secrets</strong> in AI Studio (or your
+                  Node.js server environment).
+                </li>
+                <li>
+                  Add{' '}
+                  <code className="font-mono font-semibold">OPENAI_API_KEY</code>{' '}
+                  with your official OpenAI API key (optional:{' '}
+                  <code className="font-mono font-semibold">OPENAI_MODEL</code>,
+                  default{' '}
+                  <code className="font-mono">
+                    {workspace.defaultOpenAIModel || 'gpt-4o-mini'}
+                  </code>
+                  ).
+                </li>
+                <li>
+                  Save the secret, then click <strong>Check Connection</strong>{' '}
+                  below.
+                </li>
+              </ol>
+            </div>
+          </div>
+
+          {onRefreshOpenAISecretStatus && (
+            <button
+              type="button"
+              disabled={checkingSecret}
+              onClick={async () => {
+                setCheckingSecret(true);
+                try {
+                  await onRefreshOpenAISecretStatus();
+                } finally {
+                  setCheckingSecret(false);
+                }
+              }}
+              className="px-3 py-1.5 rounded-xl bg-amber-900 hover:bg-amber-950 dark:bg-amber-500 dark:hover:bg-amber-400 text-white dark:text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 ${checkingSecret ? 'animate-spin' : ''}`}
+              />
+              <span>Check Connection</span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="h-full w-full flex overflow-hidden bg-white dark:bg-[#0F1117]">
+      {/* CENTER COLUMN: Clean Minimalist Hero Composer OR Active Conversation Stream */}
+      <div className="flex-1 min-w-0 flex flex-col h-full overflow-hidden">
+        {messages.length === 0 && !isStreaming ? (
+          <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-8 flex flex-col items-center justify-center">
+            <div className="w-full max-w-[680px] mx-auto -mt-4 space-y-6">
+              <h1 className="font-heading font-medium text-[26px] sm:text-[31px] leading-tight tracking-[-0.02em] text-slate-900 dark:text-white text-center text-balance">
+                {workspaceTab === 'work'
+                  ? 'What should we work on?'
+                  : 'How can I help you today?'}
+              </h1>
+
+              {renderOpenAISecretPrompt()}
+
+              {renderComposerCard({
+                showBottomTray: workspaceTab === 'work',
+                dropUp: false,
+              })}
+
+              {/* Clean Starter Workflow Suggestions Below Tray */}
+              <div className="pt-1 pl-3 space-y-2.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleSubmitPrompt(
+                      'Help me unblock pending project tasks and draft clear replies.'
+                    )
+                  }
+                  className="flex items-center gap-3 text-left text-[13.5px] text-slate-400 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-100 transition-colors cursor-pointer group"
+                >
+                  <span className="w-5 h-5 rounded-full bg-slate-900 dark:bg-slate-200 text-white dark:text-slate-900 flex items-center justify-center shrink-0">
+                    <Zap className="w-3 h-3" />
+                  </span>
+                  <span>
+                    Unblock project tasks that are waiting on my reply
+                  </span>
+                </button>
+
+                {streamError && (
+                  <div className="rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 px-4 py-3 text-xs text-rose-700 dark:text-rose-300">
+                    {streamError}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex-1 overflow-y-auto px-4 sm:px-7 py-4 space-y-5">
+              <div className="max-w-3xl mx-auto space-y-5 py-2">
+                {renderOpenAISecretPrompt()}
+                {!isGuest && activeSession && (
+                  <div className="rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-slate-700 dark:text-slate-200 truncate max-w-xs">
+                      {activeSession.title}
+                    </span>
+                    <div className="flex items-center gap-3 font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                      <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                        Conversation: {conversationCreditsTotal} cr used
+                      </span>
+                      <span>·</span>
+                      <span>
+                        {conversationTokensTotal.toLocaleString()} tokens
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {messages.map((msg, idx) => {
+                  const isUser = msg.role === 'user';
+                  const isLastAssistant =
+                    !isUser && idx === messages.length - 1 && !isStreaming;
+
+                  return (
+                    <div
+                      key={msg.id}
+                      className={`flex items-start gap-3.5 ${
+                        isUser ? 'justify-end' : 'justify-start'
+                      }`}
+                    >
+                      {!isUser && (
+                        <QaagaLogo className="w-8 h-8 shrink-0 mt-0.5" />
+                      )}
+
+                      <div
+                        className={`max-w-[85%] rounded-2xl px-4 py-3.5 ${
+                          isUser
+                            ? 'bg-[#F4F4F5] dark:bg-slate-800 text-slate-900 dark:text-white'
+                            : 'bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 text-slate-800 dark:text-slate-100'
+                        }`}
+                      >
+                        {msg.attachments && msg.attachments.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-2">
+                            {msg.attachments.map((att, i) => (
+                              <div
+                                key={i}
+                                className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg bg-black/10 dark:bg-white/10"
+                              >
+                                {att.previewDataUrl ? (
+                                  <img
+                                    src={att.previewDataUrl}
+                                    alt={att.name}
+                                    referrerPolicy="no-referrer"
+                                    className="w-6 h-6 rounded object-cover"
+                                  />
+                                ) : (
+                                  <FileText className="w-3.5 h-3.5" />
+                                )}
+                                <span className="truncate max-w-[160px]">
+                                  {att.name}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {msg.imageDataUrl && (
+                          <div className="mb-3 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
+                            <img
+                              src={msg.imageDataUrl}
+                              alt={msg.content}
+                              referrerPolicy="no-referrer"
+                              className="w-full max-w-md h-auto block"
+                            />
+                          </div>
+                        )}
+
+                        {isUser ? (
+                          <p className="text-sm whitespace-pre-wrap leading-relaxed">
+                            {msg.content}
+                          </p>
+                        ) : (
+                          <div className="qaaga-markdown text-sm">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {msg.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+
+                        {!isUser &&
+                          msg.citations &&
+                          msg.citations.length > 0 && (
+                            <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-2">
+                              {msg.citations.map((cit, i) => (
+                                <a
+                                  key={i}
+                                  href={cit.uri}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                                >
+                                  <ExternalLink className="w-3 h-3" />
+                                  <span className="truncate max-w-[190px]">
+                                    {cit.title}
+                                  </span>
+                                </a>
+                              ))}
+                            </div>
+                          )}
+
+                        {!isUser && (
+                          <div className="mt-3 pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 text-[11px] text-slate-400">
+                            <div className="flex items-center gap-1.5 font-mono tabular-nums">
+                              <span>{msg.model || 'qaaga'}</span>
+                              <span aria-hidden="true">·</span>
+                              <span>
+                                {isGuest
+                                  ? 'Free Chat'
+                                  : `${msg.creditsCharged} cr`}
+                              </span>
+                              {msg.tokensUsed > 0 && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span>{msg.tokensUsed} tok</span>
+                                </>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-2.5">
+                              {workspace.capabilities.features.textToSpeech
+                                .available && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isGuest) {
+                                      onRequireLogin(
+                                        'Voice Read-Aloud (TTS)',
+                                        'voice-studio'
+                                      );
+                                      return;
+                                    }
+                                    if (usageBlocked) {
+                                      onRequireRecharge(
+                                        'Please recharge your account to use neural Text-to-Speech.'
+                                      );
+                                      return;
+                                    }
+                                    onSpeak(msg.content, msg.id);
+                                  }}
+                                  className="flex items-center gap-1 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                                >
+                                  {speakingId === msg.id ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                                  ) : (
+                                    <Volume2 className="w-3.5 h-3.5" />
+                                  )}
+                                  <span>Listen</span>
+                                </button>
+                              )}
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(msg.content);
+                                  setCopiedId(msg.id);
+                                  setTimeout(() => setCopiedId(null), 1600);
+                                }}
+                                className="flex items-center gap-1 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                              >
+                                {copiedId === msg.id ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {copiedId === msg.id ? 'Copied' : 'Copy'}
+                                </span>
+                              </button>
+
+                              {isLastAssistant && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (!isGuest && usageBlocked) {
+                                      onRequireRecharge(
+                                        'Please recharge your account to regenerate responses.'
+                                      );
+                                      return;
+                                    }
+                                    onRegenerate();
+                                  }}
+                                  className="flex items-center gap-1 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  <span>Regenerate</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {isUser && (
+                        <UserAvatarBadge
+                          name={isGuest ? 'Guest' : workspace.user.fullName}
+                          role={workspace.user.role}
+                          className="w-8 h-8 mt-0.5"
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+
+                {isStreaming && (
+                  <div className="flex items-start gap-3.5">
+                    <QaagaLogo className="w-8 h-8 shrink-0 mt-0.5" />
+                    <div className="max-w-[85%] rounded-2xl px-4 py-3.5 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 text-slate-800 dark:text-slate-100">
+                      {streamingText ? (
+                        <div className="qaaga-markdown text-sm">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                            {streamingText}
+                          </ReactMarkdown>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 text-xs text-slate-500">
+                          <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                          <span>QAAGA AGENT is working...</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {streamError && (
+                  <div className="rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 px-4 py-3 text-xs text-rose-700 dark:text-rose-300">
+                    {streamError}
+                  </div>
+                )}
+
+                <div ref={endRef} />
+              </div>
+            </div>
+
+            {/* Docked Bottom Composer during Active Conversation */}
+            <div className="px-4 sm:px-7 pb-4 pt-2 shrink-0">
+              {renderComposerCard({ showBottomTray: false, dropUp: true })}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* RIGHT SIDEBAR PANEL: Previous Subscription, Credits, Quick Recharge & Usage Plans */}
+      <aside className="hidden lg:flex w-[320px] xl:w-[336px] shrink-0 flex-col h-full border-l border-slate-200/90 dark:border-slate-800 bg-white dark:bg-[#0D1425] overflow-y-auto p-4 space-y-4">
         {/* 1. Current Subscription Card */}
         <div className="rounded-2xl bg-slate-50/75 dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 p-4 space-y-3">
           <div className="flex items-center justify-between text-xs">

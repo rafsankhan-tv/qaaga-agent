@@ -155,20 +155,7 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
       creditsPer1kTokens: 1,
       description: 'Balanced speed, coding intelligence & economical token pricing',
     },
-    // 4. Google Gemini Models
-    {
-      id: 'gemini-3.8-flash',
-      label: 'Google Gemini 3.8 Flash',
-      provider: 'gemini',
-      tier: 'gemini',
-      category: 'chat',
-      enabled: true,
-      inputUsdPer1M: 0.15,
-      outputUsdPer1M: 0.6,
-      baseCreditCost: 2,
-      creditsPer1kTokens: 1,
-      description: 'Fast multimodal reasoning, native PDF vision & Google Search grounding',
-    },
+    // 4. Google Gemini Models (Fast Flash Lite ordered first for sub-second response)
     {
       id: 'gemini-3.1-flash-lite',
       label: 'Google Gemini 3.1 Flash Lite',
@@ -180,7 +167,20 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
       outputUsdPer1M: 0.3,
       baseCreditCost: 1,
       creditsPer1kTokens: 1,
-      description: 'Ultra-low-cost, high-throughput everyday chat & summarization',
+      description: 'Ultra-fast, low-cost everyday chat, PDF, vision & search',
+    },
+    {
+      id: 'gemini-3.8-flash',
+      label: 'Google Gemini 3.8 Flash',
+      provider: 'gemini',
+      tier: 'gemini',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description: 'Deep multimodal reasoning, native PDF vision & Google Search grounding',
     },
   ],
 };
@@ -601,14 +601,28 @@ export function mapUserRowToDTO(row: typeof users.$inferSelect): AuthUser {
   };
 }
 
+let cachedPlatformConfig: {
+  data: PlatformConfigDTO;
+  expiresAt: number;
+} | null = null;
+
 export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
+  if (cachedPlatformConfig && cachedPlatformConfig.expiresAt > Date.now()) {
+    return cachedPlatformConfig.data;
+  }
   try {
     await ensureSeeded();
     const rows = await db
       .select()
       .from(platformSettings)
       .where(eq(platformSettings.key, 'core_config'));
-    if (rows.length === 0) return DEFAULT_PLATFORM_CONFIG;
+    if (rows.length === 0) {
+      cachedPlatformConfig = {
+        data: DEFAULT_PLATFORM_CONFIG,
+        expiresAt: Date.now() + 45_000,
+      };
+      return DEFAULT_PLATFORM_CONFIG;
+    }
 
     const stored = JSON.parse(rows[0].valueJson) as Partial<PlatformConfigDTO>;
     const storedById = new Map(
@@ -639,7 +653,7 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
       });
     }
 
-    return {
+    const mergedConfig: PlatformConfigDTO = {
       ...DEFAULT_PLATFORM_CONFIG,
       ...stored,
       branding: {
@@ -672,6 +686,11 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
       },
       models: mergedModels,
     };
+    cachedPlatformConfig = {
+      data: mergedConfig,
+      expiresAt: Date.now() + 45_000,
+    };
+    return mergedConfig;
   } catch (error) {
     console.error('Failed to read platform config:', error);
     throw new Error('Could not load platform configuration.', { cause: error });
@@ -786,6 +805,10 @@ export async function savePlatformConfig(
         monthlySpendLimitUsd: toPersist.openaiWallet.monthlySpendLimitUsd,
       }),
     });
+    cachedPlatformConfig = {
+      data: toPersist,
+      expiresAt: Date.now() + 45_000,
+    };
     return toPersist;
   } catch (error) {
     console.error('Failed to save platform config:', error);

@@ -34,6 +34,7 @@ import {
 } from './src/db/repository.ts';
 import {
   createRateLimiter,
+  createUserRateLimiter,
   hashPassword,
   signLocalJwt,
   verifyLocalJwt,
@@ -48,8 +49,13 @@ import {
   enrichConfigWithLiveAvailability,
   extractProviderErrorMeta,
   generateImageAsset,
+  getDefaultServerOpenAIModel,
   getOpenAIRealtimeAuthHeaders,
+  isOpenAIConfigured,
+  OPENAI_PRICING_USD_PER_1M,
+  redactSecrets,
   streamChatCompletion,
+  streamOpenAIResponsesChat,
   synthesizeSpeechAudio,
   testAllProvidersConnection,
   testOpenAIConnection,
@@ -59,6 +65,7 @@ import type {
   AuthUser,
   ChatMessageDTO,
   ChatSessionDTO,
+  ModelConfigItem,
   PaymentMethodType,
   PlatformConfigDTO,
 } from './src/types/qaaga.ts';
@@ -76,6 +83,7 @@ async function startServer() {
 
   const authLimiter = createRateLimiter(20, 60_000);
   const aiLimiter = createRateLimiter(45, 60_000);
+  const perUserChatLimiter = createUserRateLimiter(20, 60_000);
   const paymentLimiter = createRateLimiter(12, 60_000);
 
   const guestChatLimiter = createRateLimiter(40, 60_000);
@@ -99,21 +107,44 @@ async function startServer() {
     res.status(400).json({ error: raw });
   };
 
-  const enforcePlatformSpendCaps = async (config: PlatformConfigDTO) => {
-    const providerLogs = await db.select().from(providerUsageLogs);
-    const now = new Date();
-    const todayStart = new Date(now);
-    todayStart.setHours(0, 0, 0, 0);
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  let spendTotalsCache: {
+    todaySpendUsd: number;
+    monthSpendUsd: number;
+    expiresAt: number;
+  } | null = null;
 
+  const trackLiveUsdSpend = (usd: number) => {
+    if (spendTotalsCache && usd > 0) {
+      spendTotalsCache.todaySpendUsd += usd;
+      spendTotalsCache.monthSpendUsd += usd;
+    }
+  };
+
+  const enforcePlatformSpendCaps = async (config: PlatformConfigDTO) => {
     let todaySpendUsd = 0;
     let monthSpendUsd = 0;
 
-    for (const r of providerLogs) {
-      const usd = Number(r.providerCostUsd) || 0;
-      const ts = new Date(r.createdAt);
-      if (ts >= todayStart) todaySpendUsd += usd;
-      if (ts >= monthStart) monthSpendUsd += usd;
+    if (spendTotalsCache && spendTotalsCache.expiresAt > Date.now()) {
+      todaySpendUsd = spendTotalsCache.todaySpendUsd;
+      monthSpendUsd = spendTotalsCache.monthSpendUsd;
+    } else {
+      const providerLogs = await db.select().from(providerUsageLogs);
+      const now = new Date();
+      const todayStart = new Date(now);
+      todayStart.setHours(0, 0, 0, 0);
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+      for (const r of providerLogs) {
+        const usd = Number(r.providerCostUsd) || 0;
+        const ts = new Date(r.createdAt);
+        if (ts >= todayStart) todaySpendUsd += usd;
+        if (ts >= monthStart) monthSpendUsd += usd;
+      }
+      spendTotalsCache = {
+        todaySpendUsd,
+        monthSpendUsd,
+        expiresAt: Date.now() + 30_000,
+      };
     }
 
     const dailyCap = config.openaiWallet.dailySpendLimitUsd ?? 15.0;
@@ -203,7 +234,12 @@ async function startServer() {
       const { enrichedConfig, capabilities } =
         await enrichConfigWithLiveAvailability(rawConfig);
       const packages = await getActivePackages();
-      res.json({ config: enrichedConfig, packages, capabilities });
+      res.json({
+        config: enrichedConfig,
+        packages,
+        capabilities,
+        defaultOpenAIModel: getDefaultServerOpenAIModel(enrichedConfig),
+      });
     } catch (error: unknown) {
       res.status(500).json({
         error:
@@ -522,30 +558,43 @@ async function startServer() {
   app.get('/api/workspace', requireAuth, async (req: AuthRequest, res) => {
     try {
       const authUser = req.authUser!;
-      const rawConfig = await getPlatformConfig();
-      const { enrichedConfig: config, capabilities } =
-        await enrichConfigWithLiveAvailability(rawConfig);
-      const packages = await getActivePackages();
-      const { summary: credits, recentLedger: ledger } =
-        await computeUserCredits(authUser.id, authUser.dailyCreditLimit);
+      const [
+        enrichedPair,
+        packages,
+        creditBundle,
+        userPayments,
+        rawSessions,
+        rawMessages,
+        userNotifs,
+      ] = await Promise.all([
+        getPlatformConfig().then((rc) => enrichConfigWithLiveAvailability(rc)),
+        getActivePackages(),
+        computeUserCredits(authUser.id, authUser.dailyCreditLimit),
+        db
+          .select()
+          .from(paymentRequests)
+          .where(eq(paymentRequests.userId, authUser.id))
+          .orderBy(desc(paymentRequests.id)),
+        db
+          .select()
+          .from(chatSessions)
+          .where(eq(chatSessions.userId, authUser.id))
+          .orderBy(desc(chatSessions.updatedAt)),
+        db
+          .select()
+          .from(chatMessages)
+          .where(eq(chatMessages.userId, authUser.id))
+          .orderBy(asc(chatMessages.id)),
+        db
+          .select()
+          .from(notifications)
+          .where(eq(notifications.userId, authUser.id))
+          .orderBy(desc(notifications.id))
+          .limit(25),
+      ]);
 
-      const userPayments = await db
-        .select()
-        .from(paymentRequests)
-        .where(eq(paymentRequests.userId, authUser.id))
-        .orderBy(desc(paymentRequests.id));
-
-      const rawSessions = await db
-        .select()
-        .from(chatSessions)
-        .where(eq(chatSessions.userId, authUser.id))
-        .orderBy(desc(chatSessions.updatedAt));
-
-      const rawMessages = await db
-        .select()
-        .from(chatMessages)
-        .where(eq(chatMessages.userId, authUser.id))
-        .orderBy(asc(chatMessages.id));
+      const { enrichedConfig: config, capabilities } = enrichedPair;
+      const { summary: credits, recentLedger: ledger } = creditBundle;
 
       const msgBySession = new Map<number, ChatMessageDTO[]>();
       for (const m of rawMessages) {
@@ -576,13 +625,6 @@ async function startServer() {
         updatedAt: s.updatedAt.toISOString(),
         messages: msgBySession.get(s.id) || [],
       }));
-
-      const userNotifs = await db
-        .select()
-        .from(notifications)
-        .where(eq(notifications.userId, authUser.id))
-        .orderBy(desc(notifications.id))
-        .limit(25);
 
       res.json({
         user: authUser,
@@ -615,6 +657,7 @@ async function startServer() {
         })),
         config,
         capabilities,
+        defaultOpenAIModel: getDefaultServerOpenAIModel(config),
       });
     } catch (error: unknown) {
       console.error('Workspace fetch error:', error);
@@ -883,7 +926,502 @@ async function startServer() {
     }
   );
 
-  // 9. Streaming AI Chat + Multimodal Vision/PDF + Grounded Search (Atomic Ledger Reservation)
+  // 9A. Official OpenAI Responses API Chat Endpoint (Authenticated + Per-User Rate Limited)
+  app.post(
+    '/api/chat',
+    requireAuth,
+    perUserChatLimiter,
+    async (req: AuthRequest, res) => {
+      const authUser = req.authUser!;
+      const {
+        sessionId,
+        prompt,
+        modelId,
+        webSearch,
+        reasoningEffort,
+        attachments,
+        regenerateLast,
+        history: clientHistory,
+      }: {
+        sessionId?: number | null;
+        prompt?: string;
+        modelId?: string;
+        webSearch?: boolean;
+        reasoningEffort?: 'low' | 'medium' | 'high';
+        regenerateLast?: boolean;
+        history?: Array<{ role?: string; content?: string }>;
+        attachments?: Array<{
+          name: string;
+          mimeType: string;
+          sizeBytes: number;
+          base64Data: string;
+          previewDataUrl?: string;
+        }>;
+      } = req.body || {};
+
+      const cleanPrompt = String(prompt || '').trim();
+      const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+
+      if (!regenerateLast && !cleanPrompt && !hasAttachments) {
+        res.status(400).json({
+          code: 'EMPTY_PROMPT',
+          error: 'Please enter a message or attach a file before sending.',
+        });
+        return;
+      }
+
+      // Strictly require process.env.OPENAI_API_KEY — never mock and never silently fall back to Gemini
+      if (!isOpenAIConfigured()) {
+        res.status(503).json({
+          code: 'OPENAI_SECRET_MISSING',
+          error:
+            'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to enable OpenAI chat.',
+        });
+        return;
+      }
+
+      try {
+        const rawConfig = await getPlatformConfig();
+        try {
+          await enforcePlatformSpendCaps(rawConfig);
+        } catch (capErr: unknown) {
+          res.status(403).json({
+            error:
+              capErr instanceof Error
+                ? redactSecrets(capErr.message)
+                : 'Platform API spending limit reached.',
+          });
+          return;
+        }
+
+        const { enrichedConfig: config } =
+          await enrichConfigWithLiveAvailability(rawConfig);
+
+        // Resolve server-configurable OpenAI model (process.env.OPENAI_MODEL -> Admin-enabled OpenAI model -> gpt-4o-mini)
+        const serverDefaultModelId = getDefaultServerOpenAIModel(config);
+        const requestedClean = String(modelId || '').trim();
+
+        const matchedConfiguredOpenAI = config.models.find(
+          (m) =>
+            m.id === requestedClean &&
+            m.provider === 'openai' &&
+            m.enabled
+        );
+        const defaultConfiguredOpenAI =
+          config.models.find(
+            (m) =>
+              m.id === serverDefaultModelId &&
+              m.provider === 'openai' &&
+              m.enabled
+          ) ||
+          config.models.find((m) => m.provider === 'openai' && m.enabled);
+
+        const chosenModel: ModelConfigItem =
+          matchedConfiguredOpenAI ||
+          (requestedClean &&
+          /^(gpt-|o1|o3|o4|chatgpt-)/i.test(requestedClean)
+            ? {
+                id: requestedClean,
+                label: requestedClean,
+                provider: 'openai',
+                tier:
+                  requestedClean.startsWith('o')
+                    ? 'openai-reasoning'
+                    : requestedClean.includes('mini') ||
+                      requestedClean.includes('nano')
+                    ? 'openai-economical'
+                    : 'openai-standard',
+                enabled: true,
+                category: requestedClean.startsWith('o') ? 'reasoning' : 'chat',
+                baseCreditCost: config.creditRates.chatBase || 1,
+                creditsPer1kTokens: config.creditRates.chatPer1kTokens || 1,
+                inputUsdPer1M:
+                  OPENAI_PRICING_USD_PER_1M[requestedClean]?.input ?? 0.15,
+                outputUsdPer1M:
+                  OPENAI_PRICING_USD_PER_1M[requestedClean]?.output ?? 0.6,
+                description: 'Server-configured OpenAI Responses API model',
+              }
+            : defaultConfiguredOpenAI &&
+              defaultConfiguredOpenAI.id === serverDefaultModelId
+            ? defaultConfiguredOpenAI
+            : {
+                id: serverDefaultModelId,
+                label:
+                  defaultConfiguredOpenAI?.label ||
+                  `OpenAI (${serverDefaultModelId})`,
+                provider: 'openai',
+                tier: 'openai-economical',
+                enabled: true,
+                category: 'chat',
+                baseCreditCost:
+                  defaultConfiguredOpenAI?.baseCreditCost ??
+                  config.creditRates.chatBase ??
+                  1,
+                creditsPer1kTokens:
+                  defaultConfiguredOpenAI?.creditsPer1kTokens ??
+                  config.creditRates.chatPer1kTokens ??
+                  1,
+                inputUsdPer1M:
+                  OPENAI_PRICING_USD_PER_1M[serverDefaultModelId]?.input ?? 0.15,
+                outputUsdPer1M:
+                  OPENAI_PRICING_USD_PER_1M[serverDefaultModelId]?.output ?? 0.6,
+                description: 'Server-configured OpenAI Responses API model',
+              });
+
+        const hasPdf = Boolean(
+          attachments?.some((a) => !a.mimeType.startsWith('image/'))
+        );
+        const hasImage = Boolean(
+          attachments?.some((a) => a.mimeType.startsWith('image/'))
+        );
+
+        if (hasPdf && !config.toolsEnabled.pdfAnalysis) {
+          res.status(403).json({
+            error:
+              'Document/PDF analysis is currently disabled by administrator.',
+          });
+          return;
+        }
+        if (hasImage && !config.toolsEnabled.imageAnalysis) {
+          res.status(403).json({
+            error: 'Image analysis is currently disabled by administrator.',
+          });
+          return;
+        }
+        if (webSearch && !config.toolsEnabled.webSearch) {
+          res.status(403).json({
+            error: 'Web Search is currently disabled by administrator.',
+          });
+          return;
+        }
+
+        const featureCategory: 'chat' | 'image' | 'pdf' | 'search' = hasPdf
+          ? 'pdf'
+          : hasImage
+          ? 'image'
+          : webSearch
+          ? 'search'
+          : 'chat';
+
+        const baseReserve =
+          featureCategory === 'pdf'
+            ? config.creditRates.pdfAnalysis
+            : featureCategory === 'image'
+            ? config.creditRates.imageAnalysis
+            : featureCategory === 'search'
+            ? config.creditRates.webSearch
+            : chosenModel.baseCreditCost || config.creditRates.chatBase;
+
+        const per1kTokenRate =
+          chosenModel.creditsPer1kTokens ?? config.creditRates.chatPer1kTokens;
+
+        const reserveAmount = baseReserve + 2;
+        const reservation = await reserveCreditsForUsage({
+          userId: authUser.id,
+          feature: featureCategory,
+          reserveAmount,
+          description: `${chosenModel.label} (${featureCategory})`,
+        });
+
+        let targetSessionId =
+          sessionId && Number(sessionId) > 0 ? Number(sessionId) : null;
+
+        if (targetSessionId) {
+          const [ownedSess] = await db
+            .select()
+            .from(chatSessions)
+            .where(
+              and(
+                eq(chatSessions.id, targetSessionId),
+                eq(chatSessions.userId, authUser.id)
+              )
+            );
+          if (!ownedSess) {
+            targetSessionId = null;
+          }
+        }
+
+        const isBrandNewSession = !targetSessionId;
+        let insertedUserMsgId: number | null = null;
+        let effectivePrompt = cleanPrompt;
+        let historyForModel: Array<{
+          role: 'user' | 'assistant';
+          content: string;
+        }> = [];
+
+        if (!targetSessionId) {
+          const [createdSess] = await db
+            .insert(chatSessions)
+            .values({
+              userId: authUser.id,
+              title: (
+                effectivePrompt ||
+                attachments?.[0]?.name ||
+                'New Conversation'
+              ).slice(0, 60),
+              model: chosenModel.id,
+              mode: featureCategory,
+            })
+            .returning();
+          targetSessionId = createdSess.id;
+        }
+
+        if (regenerateLast && targetSessionId) {
+          const existingMsgs = await db
+            .select()
+            .from(chatMessages)
+            .where(eq(chatMessages.sessionId, targetSessionId))
+            .orderBy(asc(chatMessages.id));
+
+          let remainingMsgs = existingMsgs;
+          const lastMsg = existingMsgs[existingMsgs.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            await db
+              .delete(chatMessages)
+              .where(eq(chatMessages.id, lastMsg.id));
+            remainingMsgs = existingMsgs.slice(0, -1);
+            const prevUser = existingMsgs[existingMsgs.length - 2];
+            if (prevUser && !effectivePrompt) {
+              effectivePrompt = prevUser.content;
+            }
+          }
+          historyForModel = remainingMsgs.slice(0, -1).map((m) => ({
+            role: (m.role as 'user' | 'assistant') || 'user',
+            content: m.content,
+          }));
+        } else {
+          // Load existing session history BEFORE inserting the new user message when clientHistory is omitted
+          let dbPriorMsgs: Array<{ role: string; content: string }> = [];
+          const hasClientHistory =
+            Array.isArray(clientHistory) && clientHistory.length > 0;
+
+          if (!isBrandNewSession && !hasClientHistory) {
+            dbPriorMsgs = await db
+              .select({
+                role: chatMessages.role,
+                content: chatMessages.content,
+              })
+              .from(chatMessages)
+              .where(eq(chatMessages.sessionId, targetSessionId))
+              .orderBy(asc(chatMessages.id));
+          }
+
+          const [insertedUserMsg] = await db
+            .insert(chatMessages)
+            .values({
+              sessionId: targetSessionId,
+              userId: authUser.id,
+              role: 'user',
+              content:
+                effectivePrompt ||
+                `Analyze attached file: ${attachments?.[0]?.name || 'file'}`,
+              model: chosenModel.id,
+              mode: featureCategory,
+              attachmentsJson: attachments
+                ? JSON.stringify(
+                    attachments.map((a) => ({
+                      name: a.name,
+                      mimeType: a.mimeType,
+                      sizeBytes: a.sizeBytes,
+                      previewDataUrl: a.previewDataUrl,
+                    }))
+                  )
+                : null,
+            })
+            .returning({ id: chatMessages.id });
+          insertedUserMsgId = insertedUserMsg?.id ?? null;
+
+          if (hasClientHistory) {
+            historyForModel = clientHistory!
+              .filter(
+                (m) =>
+                  (m.role === 'user' || m.role === 'assistant') &&
+                  typeof m.content === 'string' &&
+                  m.content.trim().length > 0
+              )
+              .slice(-16)
+              .map((m) => ({
+                role: m.role as 'user' | 'assistant',
+                content: String(m.content),
+              }));
+          } else if (dbPriorMsgs.length > 0) {
+            historyForModel = dbPriorMsgs
+              .filter((m) => m.role === 'user' || m.role === 'assistant')
+              .slice(-16)
+              .map((m) => ({
+                role: (m.role as 'user' | 'assistant') || 'user',
+                content: m.content,
+              }));
+          }
+        }
+
+        // Start SSE Stream immediately
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+
+        const sendSSE = (obj: Record<string, unknown>) => {
+          if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify(obj)}\n\n`);
+          }
+        };
+
+        const chatHeartbeatTimer = setInterval(() => {
+          if (!res.writableEnded) {
+            res.write(`: heartbeat\n\n`);
+          }
+        }, 5000);
+        res.on('close', () => clearInterval(chatHeartbeatTimer));
+
+        sendSSE({
+          type: 'meta',
+          sessionId: targetSessionId,
+          model: chosenModel.id,
+          provider: 'openai',
+        });
+
+        try {
+          const result = await streamOpenAIResponsesChat({
+            modelConfig: chosenModel,
+            history: historyForModel,
+            prompt: effectivePrompt,
+            webSearch: Boolean(webSearch),
+            reasoningEffort:
+              reasoningEffort &&
+              ['low', 'medium', 'high'].includes(reasoningEffort)
+                ? reasoningEffort
+                : 'low',
+            attachments: attachments?.map((a) => ({
+              name: a.name,
+              mimeType: a.mimeType,
+              base64Data: a.base64Data,
+            })),
+            userFullName: authUser.fullName,
+            onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
+          });
+
+          const actualCredits = calculateInternalCreditCharge(
+            baseReserve,
+            per1kTokenRate,
+            result.totalTokens
+          );
+
+          trackLiveUsdSpend(result.providerCostUsd);
+
+          const [, , [savedAssistant]] = await Promise.all([
+            finalizeCreditReservation({
+              userId: authUser.id,
+              reservationId: reservation.reservationId,
+              reservedAmount: reserveAmount,
+              actualAmount: actualCredits,
+              feature: featureCategory,
+              description: `${result.modelUsed} · ${result.totalTokens} tokens`,
+            }),
+            db.insert(providerUsageLogs).values({
+              userId: authUser.id,
+              provider: 'openai',
+              model: result.modelUsed,
+              feature: featureCategory,
+              promptTokens: result.promptTokens,
+              completionTokens: result.completionTokens,
+              totalTokens: result.totalTokens,
+              providerCostUsd: result.providerCostUsd.toFixed(6),
+              internalCreditsCharged: actualCredits,
+            }),
+            db
+              .insert(chatMessages)
+              .values({
+                sessionId: targetSessionId,
+                userId: authUser.id,
+                role: 'assistant',
+                content: result.fullText || 'Completed.',
+                model: result.modelUsed,
+                mode: featureCategory,
+                citationsJson:
+                  result.citations.length > 0
+                    ? JSON.stringify(result.citations)
+                    : null,
+                creditsCharged: actualCredits,
+                tokensUsed: result.totalTokens,
+                providerCostUsd: result.providerCostUsd.toFixed(6),
+              })
+              .returning(),
+            db
+              .update(chatSessions)
+              .set({ updatedAt: new Date() })
+              .where(eq(chatSessions.id, targetSessionId)),
+          ]);
+
+          sendSSE({
+            type: 'done',
+            sessionId: targetSessionId,
+            messageId: savedAssistant.id,
+            creditsCharged: actualCredits,
+            tokensUsed: result.totalTokens,
+            providerUsed: 'openai',
+            modelUsed: result.modelUsed,
+            citations: result.citations,
+          });
+          clearInterval(chatHeartbeatTimer);
+          res.end();
+        } catch (streamErr: unknown) {
+          clearInterval(chatHeartbeatTimer);
+          // 100% Atomic Refund on OpenAI API Failure + remove orphaned failed turn
+          await finalizeCreditReservation({
+            userId: authUser.id,
+            reservationId: reservation.reservationId,
+            reservedAmount: reserveAmount,
+            actualAmount: 0,
+            feature: featureCategory,
+            description: 'OpenAI API failure refund',
+          });
+          if (insertedUserMsgId) {
+            await db
+              .delete(chatMessages)
+              .where(eq(chatMessages.id, insertedUserMsgId))
+              .catch(() => undefined);
+          }
+          if (isBrandNewSession && targetSessionId) {
+            await db
+              .delete(chatSessions)
+              .where(eq(chatSessions.id, targetSessionId))
+              .catch(() => undefined);
+          }
+          const errMeta = extractProviderErrorMeta(streamErr);
+          await recordProviderApiError({
+            actorUserId: authUser.id,
+            actorEmail: authUser.email,
+            provider: 'openai',
+            model: chosenModel.id,
+            feature: featureCategory,
+            status: errMeta.status,
+            errorCode: errMeta.errorCode,
+            safeMessage: errMeta.safeMessage,
+          });
+          sendSSE({
+            type: 'error',
+            code: errMeta.errorCode || 'OPENAI_API_ERROR',
+            error: redactSecrets(
+              streamErr instanceof Error
+                ? streamErr.message
+                : 'OpenAI Responses API request failed.'
+            ),
+          });
+          res.end();
+        }
+      } catch (outerError: unknown) {
+        sendCommandError(
+          res,
+          outerError,
+          'Unable to start OpenAI chat response.'
+        );
+      }
+    }
+  );
+
+  // 9B. Multi-Provider Streaming AI Chat (Used when explicit Gemini model is chosen)
   app.post(
     '/api/chat/stream',
     requireAuth,
@@ -898,6 +1436,7 @@ async function startServer() {
         reasoningEffort,
         attachments,
         regenerateLast,
+        history: clientHistory,
       }: {
         sessionId?: number | null;
         prompt?: string;
@@ -905,6 +1444,7 @@ async function startServer() {
         webSearch?: boolean;
         reasoningEffort?: 'low' | 'medium' | 'high';
         regenerateLast?: boolean;
+        history?: Array<{ role?: string; content?: string }>;
         attachments?: Array<{
           name: string;
           mimeType: string;
@@ -1001,7 +1541,9 @@ async function startServer() {
         });
 
         let targetSessionId = sessionId ? Number(sessionId) : null;
+        const isBrandNewSession = !targetSessionId;
         let effectivePrompt = String(prompt || '').trim();
+        let historyForModel: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
         if (!targetSessionId) {
           const [createdSess] = await db
@@ -1020,7 +1562,7 @@ async function startServer() {
           targetSessionId = createdSess.id;
         }
 
-        // Handle Regenerate Last Assistant Response
+        // Handle Regenerate Last Assistant Response vs Standard Message Append
         if (regenerateLast && targetSessionId) {
           const existingMsgs = await db
             .select()
@@ -1028,19 +1570,24 @@ async function startServer() {
             .where(eq(chatMessages.sessionId, targetSessionId))
             .orderBy(asc(chatMessages.id));
 
+          let remainingMsgs = existingMsgs;
           const lastMsg = existingMsgs[existingMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
             await db
               .delete(chatMessages)
               .where(eq(chatMessages.id, lastMsg.id));
+            remainingMsgs = existingMsgs.slice(0, -1);
             const prevUser = existingMsgs[existingMsgs.length - 2];
             if (prevUser && !effectivePrompt) {
               effectivePrompt = prevUser.content;
             }
           }
+          historyForModel = remainingMsgs.slice(0, -1).map((m) => ({
+            role: (m.role as 'user' | 'assistant') || 'user',
+            content: m.content,
+          }));
         } else {
-          // Insert user message
-          await db.insert(chatMessages).values({
+          const insertUserMsgPromise = db.insert(chatMessages).values({
             sessionId: targetSessionId,
             userId: authUser.id,
             role: 'user',
@@ -1060,20 +1607,44 @@ async function startServer() {
                 )
               : null,
           });
+
+          if (isBrandNewSession) {
+            await insertUserMsgPromise;
+            historyForModel = [];
+          } else if (Array.isArray(clientHistory)) {
+            await insertUserMsgPromise;
+            historyForModel = clientHistory
+              .filter(
+                (m) =>
+                  (m.role === 'user' || m.role === 'assistant') &&
+                  typeof m.content === 'string' &&
+                  m.content.trim().length > 0
+              )
+              .slice(-12)
+              .map((m) => ({
+                role: m.role as 'user' | 'assistant',
+                content: String(m.content),
+              }));
+          } else {
+            const [, priorMsgs] = await Promise.all([
+              insertUserMsgPromise,
+              db
+                .select()
+                .from(chatMessages)
+                .where(eq(chatMessages.sessionId, targetSessionId))
+                .orderBy(asc(chatMessages.id)),
+            ]);
+            historyForModel = priorMsgs
+              .filter((m) => m.role === 'user' || m.role === 'assistant')
+              .slice(-12)
+              .map((m) => ({
+                role: (m.role as 'user' | 'assistant') || 'user',
+                content: m.content,
+              }));
+          }
         }
 
-        const priorMsgs = await db
-          .select()
-          .from(chatMessages)
-          .where(eq(chatMessages.sessionId, targetSessionId))
-          .orderBy(asc(chatMessages.id));
-
-        const historyForModel = priorMsgs.slice(0, -1).map((m) => ({
-          role: (m.role as 'user' | 'assistant') || 'user',
-          content: m.content,
-        }));
-
-        // Start SSE Stream
+        // Start SSE Stream immediately
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache, no-transform');
         res.setHeader('Connection', 'keep-alive');
@@ -1109,7 +1680,7 @@ async function startServer() {
               reasoningEffort &&
               ['low', 'medium', 'high'].includes(reasoningEffort)
                 ? reasoningEffort
-                : 'medium',
+                : 'low',
             attachments: attachments?.map((a) => ({
               name: a.name,
               mimeType: a.mimeType,
@@ -1125,51 +1696,51 @@ async function startServer() {
             result.totalTokens
           );
 
-          await finalizeCreditReservation({
-            userId: authUser.id,
-            reservationId: reservation.reservationId,
-            reservedAmount: reserveAmount,
-            actualAmount: actualCredits,
-            feature: featureCategory,
-            description: `${result.modelUsed} · ${result.totalTokens} tokens`,
-          });
+          trackLiveUsdSpend(result.providerCostUsd);
 
-          // Log Provider Token & USD Spend independently from User Internal Credits
-          await db.insert(providerUsageLogs).values({
-            userId: authUser.id,
-            provider: result.providerUsed,
-            model: result.modelUsed,
-            feature: featureCategory,
-            promptTokens: result.promptTokens,
-            completionTokens: result.completionTokens,
-            totalTokens: result.totalTokens,
-            providerCostUsd: result.providerCostUsd.toFixed(6),
-            internalCreditsCharged: actualCredits,
-          });
-
-          const [savedAssistant] = await db
-            .insert(chatMessages)
-            .values({
-              sessionId: targetSessionId,
+          const [, , [savedAssistant]] = await Promise.all([
+            finalizeCreditReservation({
               userId: authUser.id,
-              role: 'assistant',
-              content: result.fullText || 'Completed.',
-              model: chosenModel.id,
-              mode: featureCategory,
-              citationsJson:
-                result.citations.length > 0
-                  ? JSON.stringify(result.citations)
-                  : null,
-              creditsCharged: actualCredits,
-              tokensUsed: result.totalTokens,
+              reservationId: reservation.reservationId,
+              reservedAmount: reserveAmount,
+              actualAmount: actualCredits,
+              feature: featureCategory,
+              description: `${result.modelUsed} · ${result.totalTokens} tokens`,
+            }),
+            db.insert(providerUsageLogs).values({
+              userId: authUser.id,
+              provider: result.providerUsed,
+              model: result.modelUsed,
+              feature: featureCategory,
+              promptTokens: result.promptTokens,
+              completionTokens: result.completionTokens,
+              totalTokens: result.totalTokens,
               providerCostUsd: result.providerCostUsd.toFixed(6),
-            })
-            .returning();
-
-          await db
-            .update(chatSessions)
-            .set({ updatedAt: new Date() })
-            .where(eq(chatSessions.id, targetSessionId));
+              internalCreditsCharged: actualCredits,
+            }),
+            db
+              .insert(chatMessages)
+              .values({
+                sessionId: targetSessionId,
+                userId: authUser.id,
+                role: 'assistant',
+                content: result.fullText || 'Completed.',
+                model: chosenModel.id,
+                mode: featureCategory,
+                citationsJson:
+                  result.citations.length > 0
+                    ? JSON.stringify(result.citations)
+                    : null,
+                creditsCharged: actualCredits,
+                tokensUsed: result.totalTokens,
+                providerCostUsd: result.providerCostUsd.toFixed(6),
+              })
+              .returning(),
+            db
+              .update(chatSessions)
+              .set({ updatedAt: new Date() })
+              .where(eq(chatSessions.id, targetSessionId)),
+          ]);
 
           sendSSE({
             type: 'done',
@@ -2398,6 +2969,12 @@ async function startServer() {
 
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`QAAGA AGENT SaaS Server listening on http://0.0.0.0:${PORT}`);
+    // Asynchronously pre-warm DB platform config & AI provider availability caches
+    void getPlatformConfig()
+      .then((cfg) => enrichConfigWithLiveAvailability(cfg))
+      .catch(() => {
+        // non-blocking warm-up
+      });
   });
 }
 

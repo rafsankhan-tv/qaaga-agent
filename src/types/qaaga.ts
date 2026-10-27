@@ -282,6 +282,7 @@ export interface WorkspacePayload {
   }>;
   config: PlatformConfigDTO;
   capabilities: ProviderCapabilitiesDTO;
+  defaultOpenAIModel?: string;
 }
 
 export interface AdminActivityLogItem {

@@ -3,27 +3,29 @@ import {
   Bell,
   ChevronDown,
   Menu,
-  Plus,
-  Check,
+  PanelLeftOpen,
   LogIn,
   LogOut,
   User as UserIcon,
   ShieldCheck,
+  CreditCard,
+  Moon,
+  Sun,
 } from 'lucide-react';
-import type {
-  ModelConfigItem,
-  NavSection,
-  ProviderCapabilitiesDTO,
-  WorkspacePayload,
-} from '../types/qaaga';
-import { UserAvatarBadge } from './BrandIcons';
+import type { NavSection, WorkspacePayload } from '../types/qaaga';
+import { QaagaLogo, UserAvatarBadge } from './BrandIcons';
 
 interface WorkspaceHeaderProps {
   workspace: WorkspacePayload;
   isGuest?: boolean;
+  workspaceTab?: 'chat' | 'work';
+  onChangeWorkspaceTab?: (tab: 'chat' | 'work') => void;
+  sidebarCollapsed?: boolean;
+  onExpandSidebar?: () => void;
   selectedModelId: string;
   onSelectModel: (id: string) => void;
   onNavigate: (nav: NavSection) => void;
+  onToggleTheme?: () => void;
   onOpenLogin?: (reasonFeature?: string, pendingNav?: NavSection) => void;
   onLogout?: () => void;
   onMarkNotificationsRead: () => void;
@@ -33,26 +35,24 @@ interface WorkspaceHeaderProps {
 export function WorkspaceHeader({
   workspace,
   isGuest = false,
-  selectedModelId,
-  onSelectModel,
+  workspaceTab = 'work',
+  onChangeWorkspaceTab,
+  sidebarCollapsed = false,
+  onExpandSidebar,
   onNavigate,
+  onToggleTheme,
   onOpenLogin,
   onLogout,
   onMarkNotificationsRead,
   onOpenMobileMenu,
 }: WorkspaceHeaderProps) {
-  const [modelOpen, setModelOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const modelRef = useRef<HTMLDivElement>(null);
   const notifRef = useRef<HTMLDivElement>(null);
   const profileRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (modelRef.current && !modelRef.current.contains(e.target as Node)) {
-        setModelOpen(false);
-      }
       if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
         setNotifOpen(false);
       }
@@ -67,171 +67,81 @@ export function WorkspaceHeader({
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  // Show only supported, enabled, and live-available models to end users
-  const availableModels: ModelConfigItem[] = workspace.config.models.filter(
-    (m) => m.enabled && m.available !== false
-  );
-  const selectableModels =
-    availableModels.length > 0
-      ? availableModels
-      : workspace.config.models.filter((m) => m.enabled);
-
-  const activeModel =
-    selectableModels.find((m) => m.id === selectedModelId) ||
-    selectableModels[0] ||
-    workspace.config.models[0];
-
-  const tierGroups: Array<{
-    tier: NonNullable<ModelConfigItem['tier']>;
-    title: string;
-    items: ModelConfigItem[];
-  }> = [
-    {
-      tier: 'openai-reasoning' as const,
-      title: 'OpenAI · Advanced Reasoning',
-      items: selectableModels.filter((m) => m.tier === 'openai-reasoning'),
-    },
-    {
-      tier: 'openai-standard' as const,
-      title: 'OpenAI · Standard Models',
-      items: selectableModels.filter(
-        (m) =>
-          m.tier === 'openai-standard' ||
-          (!m.tier && m.provider === 'openai' && !m.id.includes('mini'))
-      ),
-    },
-    {
-      tier: 'openai-economical' as const,
-      title: 'OpenAI · Economical Models',
-      items: selectableModels.filter(
-        (m) =>
-          m.tier === 'openai-economical' ||
-          (!m.tier && m.provider === 'openai' && m.id.includes('mini'))
-      ),
-    },
-    {
-      tier: 'gemini' as const,
-      title: 'Google Gemini Models',
-      items: selectableModels.filter(
-        (m) =>
-          m.tier === 'gemini' ||
-          m.provider === 'gemini' ||
-          m.provider === 'bridge'
-      ),
-    },
-  ].filter((g) => g.items.length > 0);
-
   const unreadCount = workspace.notifications.filter((n) => !n.isRead).length;
-  const caps: ProviderCapabilitiesDTO = workspace.capabilities;
 
   return (
-    <header className="h-16 bg-white dark:bg-[#111827] border-b border-slate-200/90 dark:border-slate-800 px-4 sm:px-6 flex items-center justify-between gap-4 shrink-0 z-20">
-      {/* Left: Mobile Menu + Model Selector */}
-      <div className="flex items-center gap-3 min-w-0">
+    <header className="h-14 bg-white dark:bg-[#0F1117] px-4 sm:px-6 grid grid-cols-[1fr_auto_1fr] items-center gap-3 shrink-0 z-20">
+      {/* Left: Mobile Menu or Collapsed Sidebar Opener */}
+      <div className="flex items-center gap-2 min-w-0">
         <button
           type="button"
           onClick={onOpenMobileMenu}
-          className="lg:hidden p-2 rounded-xl border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300"
+          className="lg:hidden p-2 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
           aria-label="Open menu"
         >
           <Menu className="w-4 h-4" />
         </button>
 
-        <div className="relative" ref={modelRef}>
+        {sidebarCollapsed && onExpandSidebar && (
           <button
             type="button"
-            onClick={() => setModelOpen((o) => !o)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800/90 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-[13px] font-semibold text-slate-900 dark:text-slate-100 cursor-pointer whitespace-nowrap"
+            onClick={onExpandSidebar}
+            className="hidden lg:inline-flex items-center gap-2 px-2.5 py-1.5 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            title="Open sidebar"
           >
-            <span className="truncate max-w-[190px]">
-              {activeModel?.label || 'Gemini 3.8 Flash'}
-            </span>
-            <span className="text-[11px] font-mono font-medium text-emerald-700 dark:text-emerald-400">
-              · {activeModel?.baseCreditCost ?? 2} cr
-            </span>
-            <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-          </button>
-
-          {modelOpen && (
-            <div className="absolute left-0 mt-2 w-88 max-h-[420px] overflow-y-auto rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-lg p-2 z-50">
-              <div className="px-3 py-1.5 border-b border-slate-100 dark:border-slate-800 text-[11px] font-medium text-slate-500 dark:text-slate-400 flex items-center justify-between">
-                <span>Supported & Available Models</span>
-                <span className="font-mono text-emerald-700 dark:text-emerald-400">
-                  {caps.openaiLiveVerified && caps.geminiConfigured
-                    ? 'OpenAI + Gemini Live'
-                    : caps.openaiLiveVerified
-                    ? 'OpenAI Live'
-                    : 'Gemini Live'}
-                </span>
-              </div>
-
-              <div className="divide-y divide-slate-100 dark:divide-slate-800/80">
-                {tierGroups.map((group) => (
-                  <div key={group.tier} className="py-1.5">
-                    <div className="px-3 py-1 text-[10.5px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                      {group.title}
-                    </div>
-                    {group.items.map((m) => {
-                      const selected = m.id === activeModel?.id;
-                      return (
-                        <button
-                          key={m.id}
-                          type="button"
-                          onClick={() => {
-                            onSelectModel(m.id);
-                            setModelOpen(false);
-                          }}
-                          className={`w-full text-left px-3 py-2 rounded-xl flex items-start justify-between gap-2 transition-colors cursor-pointer ${
-                            selected
-                              ? 'bg-emerald-50 dark:bg-emerald-950/40'
-                              : 'hover:bg-slate-50 dark:hover:bg-slate-800/70'
-                          }`}
-                        >
-                          <div className="min-w-0">
-                            <div className="text-[13px] font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                              <span className="truncate">{m.label}</span>
-                            </div>
-                            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 leading-snug">
-                              {m.description}
-                            </p>
-                            <p className="text-[10.5px] font-mono text-emerald-700 dark:text-emerald-400 mt-0.5 tabular-nums">
-                              Base {m.baseCreditCost} cr · +{m.creditsPer1kTokens ?? 1} cr/1K tok
-                            </p>
-                          </div>
-                          {selected && (
-                            <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Right: Recharge CTA, Notifications & Login / User Profile */}
-      <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
-        {!isGuest && (
-          <button
-            type="button"
-            onClick={() => onNavigate('credit-dashboard')}
-            className="hidden md:flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer whitespace-nowrap"
-          >
-            <span className="font-mono font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
-              {workspace.credits.remaining} cr
-            </span>
-            <span aria-hidden="true">·</span>
-            <span>
-              {workspace.user.isSubscriptionActive
-                ? `${workspace.user.daysRemaining}d left`
-                : 'Recharge Needed'}
+            <PanelLeftOpen className="w-4 h-4" />
+            <QaagaLogo className="w-5 h-5" />
+            <span className="font-heading font-semibold text-sm text-slate-900 dark:text-white">
+              QAAGA AGENT
             </span>
           </button>
         )}
+      </div>
 
+      {/* Center: Clean Chat | Work Segmented Switcher */}
+      <div className="flex items-center justify-center">
+        <div
+          role="tablist"
+          aria-label="Workspace mode"
+          className="inline-flex items-center p-1 rounded-full bg-[#EFEFEF] dark:bg-slate-800/90"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceTab === 'chat'}
+            onClick={() => {
+              onChangeWorkspaceTab?.('chat');
+              onNavigate('chat');
+            }}
+            className={`px-5 py-1 rounded-full text-[13px] font-medium transition-all cursor-pointer ${
+              workspaceTab === 'chat'
+                ? 'bg-white dark:bg-slate-950 text-slate-900 dark:text-white shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            Chat
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={workspaceTab === 'work'}
+            onClick={() => {
+              onChangeWorkspaceTab?.('work');
+              onNavigate('chat');
+            }}
+            className={`px-5 py-1 rounded-full text-[13px] font-medium transition-all cursor-pointer ${
+              workspaceTab === 'work'
+                ? 'bg-white dark:bg-slate-950 text-slate-900 dark:text-white shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+            }`}
+          >
+            Work
+          </button>
+        </div>
+      </div>
+
+      {/* Right: Mobile Recharge Shortcut, Theme, Notifications & Account */}
+      <div className="flex items-center justify-end gap-2 shrink-0">
         <button
           type="button"
           onClick={() => {
@@ -241,20 +151,38 @@ export function WorkspaceHeader({
               onNavigate('recharge');
             }
           }}
-          className="px-3.5 py-2 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+          className="lg:hidden px-3 py-1.5 rounded-full bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
         >
-          <Plus className="w-3.5 h-3.5" />
+          <CreditCard className="w-3.5 h-3.5" />
           <span>Recharge</span>
         </button>
+
+        {onToggleTheme && (
+          <button
+            type="button"
+            onClick={onToggleTheme}
+            className="p-2 rounded-full text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            title={
+              workspace.user.theme === 'dark' ? 'Light mode' : 'Dark mode'
+            }
+            aria-label="Toggle theme"
+          >
+            {workspace.user.theme === 'dark' ? (
+              <Sun className="w-[17px] h-[17px] text-amber-400" />
+            ) : (
+              <Moon className="w-[17px] h-[17px]" />
+            )}
+          </button>
+        )}
 
         {isGuest ? (
           <button
             type="button"
             onClick={() => onOpenLogin?.()}
-            className="px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-900 dark:text-white text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+            className="px-3.5 py-1.5 rounded-full border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-900 dark:text-white text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
           >
-            <LogIn className="w-3.5 h-3.5 text-emerald-600" />
-            <span>Sign In</span>
+            <LogIn className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" />
+            <span>Sign in</span>
           </button>
         ) : (
           <>
@@ -266,10 +194,10 @@ export function WorkspaceHeader({
                   setNotifOpen(next);
                   if (next && unreadCount > 0) onMarkNotificationsRead();
                 }}
-                className="relative p-2 rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                className="relative p-2 rounded-full text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
                 aria-label="Notifications"
               >
-                <Bell className="w-4 h-4" />
+                <Bell className="w-[17px] h-[17px]" />
                 {unreadCount > 0 && (
                   <span className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-rose-500" />
                 )}
@@ -305,21 +233,18 @@ export function WorkspaceHeader({
               )}
             </div>
 
-            {/* Logged-in User Profile Menu */}
             <div className="relative" ref={profileRef}>
               <button
                 type="button"
                 onClick={() => setProfileOpen((o) => !o)}
-                className="flex items-center gap-2 pl-1.5 pr-2.5 py-1 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                className="flex items-center gap-1.5 p-1 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
               >
                 <UserAvatarBadge
                   name={workspace.user.fullName}
                   role={workspace.user.role}
+                  className="w-7 h-7"
                 />
-                <span className="hidden sm:inline text-xs font-bold text-slate-900 dark:text-white max-w-[120px] truncate">
-                  {workspace.user.fullName}
-                </span>
-                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 hidden sm:inline" />
               </button>
 
               {profileOpen && (

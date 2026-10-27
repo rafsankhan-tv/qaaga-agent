@@ -105,6 +105,9 @@ export function getOpenAIRealtimeAuthHeaders(): Record<string, string> {
   };
 }
 
+let cachedOpenAIClient: { key: string; client: OpenAI } | null = null;
+let cachedGeminiClient: { key: string; client: GoogleGenAI } | null = null;
+
 function getOpenAIClient(): OpenAI {
   const apiKey = getServerOpenAIKey();
   if (!apiKey || PLACEHOLDER_KEYS.has(apiKey)) {
@@ -112,7 +115,12 @@ function getOpenAIClient(): OpenAI {
       'OpenAI API key is not configured on the server. Add a valid OPENAI_API_KEY in Settings > Secrets.'
     );
   }
-  return new OpenAI({ apiKey });
+  if (cachedOpenAIClient && cachedOpenAIClient.key === apiKey) {
+    return cachedOpenAIClient.client;
+  }
+  const client = new OpenAI({ apiKey });
+  cachedOpenAIClient = { key: apiKey, client };
+  return client;
 }
 
 function getGeminiClient(): GoogleGenAI {
@@ -122,7 +130,10 @@ function getGeminiClient(): GoogleGenAI {
       'Google Gemini API key is not configured on the server. Check GEMINI_API_KEY in Settings > Secrets.'
     );
   }
-  return new GoogleGenAI({
+  if (cachedGeminiClient && cachedGeminiClient.key === apiKey) {
+    return cachedGeminiClient.client;
+  }
+  const client = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
@@ -130,6 +141,8 @@ function getGeminiClient(): GoogleGenAI {
       },
     },
   });
+  cachedGeminiClient = { key: apiKey, client };
+  return client;
 }
 
 export function extractProviderErrorMeta(err: unknown): {
@@ -283,6 +296,11 @@ let cachedDiscovery: {
   rawModelIds: Set<string>;
 } | null = null;
 
+let discoveryInFlight: Promise<{
+  discovery: OpenAIAccountDiscoveryDTO;
+  rawModelIds: Set<string>;
+}> | null = null;
+
 function fingerprintKey(k: string): string {
   if (!k) return 'none';
   return `${k.length}:${k.charCodeAt(0)}:${k.charCodeAt(k.length - 1)}`;
@@ -300,27 +318,13 @@ function emptyCategorizedModels(): OpenAIAccountDiscoveryDTO['categorizedModels'
   };
 }
 
-export async function discoverOpenAIAccountModels(
-  forceRefresh = false
+async function refreshOpenAIDiscoveryNow(
+  rawKey: string,
+  fp: string
 ): Promise<{
   discovery: OpenAIAccountDiscoveryDTO;
   rawModelIds: Set<string>;
 }> {
-  const rawKey = getServerOpenAIKey();
-  const fp = fingerprintKey(rawKey);
-
-  if (
-    !forceRefresh &&
-    cachedDiscovery &&
-    cachedDiscovery.keyFingerprint === fp &&
-    cachedDiscovery.expiresAt > Date.now()
-  ) {
-    return {
-      discovery: cachedDiscovery.data,
-      rawModelIds: cachedDiscovery.rawModelIds,
-    };
-  }
-
   if (!rawKey || PLACEHOLDER_KEYS.has(rawKey)) {
     const empty: OpenAIAccountDiscoveryDTO = {
       checkedAt: new Date().toISOString(),
@@ -335,7 +339,7 @@ export async function discoverOpenAIAccountModels(
     };
     cachedDiscovery = {
       keyFingerprint: fp,
-      expiresAt: Date.now() + 30_000,
+      expiresAt: Date.now() + 300_000,
       data: empty,
       rawModelIds: new Set(),
     };
@@ -343,7 +347,7 @@ export async function discoverOpenAIAccountModels(
   }
 
   try {
-    const openai = new OpenAI({ apiKey: rawKey });
+    const openai = getOpenAIClient();
     const list = await openai.models.list();
     const ids = list.data.map((m) => m.id).sort();
     const rawSet = new Set(ids);
@@ -384,7 +388,7 @@ export async function discoverOpenAIAccountModels(
 
     cachedDiscovery = {
       keyFingerprint: fp,
-      expiresAt: Date.now() + 60_000,
+      expiresAt: Date.now() + 300_000,
       data,
       rawModelIds: rawSet,
     };
@@ -404,12 +408,58 @@ export async function discoverOpenAIAccountModels(
     };
     cachedDiscovery = {
       keyFingerprint: fp,
-      expiresAt: Date.now() + 30_000,
+      expiresAt: Date.now() + 180_000,
       data: failed,
       rawModelIds: new Set(),
     };
     return { discovery: failed, rawModelIds: new Set() };
   }
+}
+
+export async function discoverOpenAIAccountModels(
+  forceRefresh = false
+): Promise<{
+  discovery: OpenAIAccountDiscoveryDTO;
+  rawModelIds: Set<string>;
+}> {
+  const rawKey = getServerOpenAIKey();
+  const fp = fingerprintKey(rawKey);
+
+  if (
+    !forceRefresh &&
+    cachedDiscovery &&
+    cachedDiscovery.keyFingerprint === fp &&
+    cachedDiscovery.expiresAt > Date.now()
+  ) {
+    return {
+      discovery: cachedDiscovery.data,
+      rawModelIds: cachedDiscovery.rawModelIds,
+    };
+  }
+
+  // Stale-while-revalidate: never block user chat/commands when key hasn't changed
+  if (
+    !forceRefresh &&
+    cachedDiscovery &&
+    cachedDiscovery.keyFingerprint === fp
+  ) {
+    if (!discoveryInFlight) {
+      discoveryInFlight = refreshOpenAIDiscoveryNow(rawKey, fp).finally(() => {
+        discoveryInFlight = null;
+      });
+    }
+    return {
+      discovery: cachedDiscovery.data,
+      rawModelIds: cachedDiscovery.rawModelIds,
+    };
+  }
+
+  if (!discoveryInFlight || forceRefresh) {
+    discoveryInFlight = refreshOpenAIDiscoveryNow(rawKey, fp).finally(() => {
+      discoveryInFlight = null;
+    });
+  }
+  return discoveryInFlight;
 }
 
 /**
@@ -797,26 +847,34 @@ function buildSystemInstruction(userFullName: string): string {
 - Maintain original QAAGA AGENT identity.`;
 }
 
+export function getDefaultServerOpenAIModel(
+  config?: PlatformConfigDTO
+): string {
+  const envModel = (process.env.OPENAI_MODEL || '').trim();
+  if (envModel) {
+    return envModel;
+  }
+  const enabledOpenAI =
+    config?.models.filter((m) => m.provider === 'openai' && m.enabled) || [];
+  const preferredMini = enabledOpenAI.find((m) => m.id === 'gpt-4o-mini');
+  if (preferredMini) return preferredMini.id;
+  if (enabledOpenAI.length > 0) return enabledOpenAI[0].id;
+  return 'gpt-4o-mini';
+}
+
 function resolveOfficialOpenAIModel(requestedId: string): string {
   const clean = (requestedId || '').trim();
-  const allowed = new Set([
-    'o3',
-    'o3-mini',
-    'o4-mini',
-    'o1',
-    'gpt-4o',
-    'gpt-4o-mini',
-    'gpt-4.1',
-    'gpt-4.1-mini',
-    'gpt-4.1-nano',
-    'gpt-4o-search-preview',
-    'gpt-4o-mini-search-preview',
-  ]);
-  if (allowed.has(clean)) return clean;
-  if (clean.startsWith('o4')) return 'o4-mini';
-  if (clean.startsWith('o3')) return 'o3-mini';
-  if (clean.includes('mini')) return 'gpt-4o-mini';
-  return 'gpt-4o';
+  // Map legacy Chat Completions search-preview aliases to Responses API base models (web_search_preview tool handles search)
+  if (clean === 'gpt-4o-mini-search-preview') return 'gpt-4o-mini';
+  if (clean === 'gpt-4o-search-preview') return 'gpt-4o';
+
+  // Honor explicit official OpenAI model IDs (gpt-*, o1*, o3*, o4*, chatgpt-*) or server env OPENAI_MODEL
+  const envModel = (process.env.OPENAI_MODEL || '').trim();
+  if (clean && clean === envModel) return clean;
+  if (/^(gpt-|o1|o3|o4|chatgpt-)/i.test(clean)) {
+    return clean;
+  }
+  return getDefaultServerOpenAIModel();
 }
 
 function resolveAllowedGeminiModel(requestedId: string): string {
@@ -847,16 +905,32 @@ export async function streamChatCompletion(
   if (selectedProvider === 'gemini') {
     return streamGeminiChatCompletion(opts);
   }
-  return streamOpenAIChatCompletion(opts);
+  return streamOpenAIResponsesChat(opts);
 }
 
-async function streamOpenAIChatCompletion(
+/**
+ * Streams real assistant responses via the official OpenAI Responses API (`openai.responses.create`)
+ * with multi-turn conversation history, multimodal inputs, optional web_search_preview, and reasoning effort.
+ * Never exposes OPENAI_API_KEY and never falls back to Gemini or mock data.
+ */
+export async function streamOpenAIResponsesChat(
   opts: StreamChatOptions
 ): Promise<StreamChatResult> {
-  const openai = getOpenAIClient();
-  const systemPrompt = buildSystemInstruction(opts.userFullName);
+  if (!isOpenAIConfigured()) {
+    const missingErr = new Error(
+      'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets.'
+    ) as Error & { code?: string; status?: number };
+    missingErr.code = 'OPENAI_SECRET_MISSING';
+    missingErr.status = 503;
+    throw missingErr;
+  }
 
-  const hasAttachments = Boolean(opts.attachments && opts.attachments.length > 0);
+  const openai = getOpenAIClient();
+  const systemInstructions = buildSystemInstruction(opts.userFullName);
+
+  const hasAttachments = Boolean(
+    opts.attachments && opts.attachments.length > 0
+  );
   const hasBinaryPdfOrImage = Boolean(
     opts.attachments?.some(
       (a) =>
@@ -865,13 +939,8 @@ async function streamOpenAIChatCompletion(
   );
 
   let targetModel = resolveOfficialOpenAIModel(opts.modelConfig.id);
-
-  if (opts.webSearch) {
-    targetModel = targetModel.includes('mini')
-      ? 'gpt-4o-mini-search-preview'
-      : 'gpt-4o-search-preview';
-  } else if (hasBinaryPdfOrImage && targetModel === 'o3-mini') {
-    // o3-mini is text-only; route PDF/image attachments to gpt-4o within OpenAI
+  if (hasBinaryPdfOrImage && targetModel === 'o3-mini') {
+    // o3-mini is text-only; use gpt-4o within OpenAI for image/PDF inspection
     targetModel = 'gpt-4o';
   }
 
@@ -879,139 +948,178 @@ async function streamOpenAIChatCompletion(
     targetModel === 'o3' ||
     targetModel.startsWith('o3-') ||
     targetModel.startsWith('o4-') ||
-    targetModel === 'o1';
+    targetModel === 'o1' ||
+    targetModel.startsWith('gpt-5');
 
-  const userContentParts: Array<Record<string, unknown>> = [];
+  const promptText =
+    opts.prompt?.trim() ||
+    'Analyze and summarize the attached document or image thoroughly.';
+
+  // Build Responses API multi-turn input array preserving conversation history
+  const inputItems: Array<Record<string, unknown>> = opts.history
+    .slice(-16)
+    .filter(
+      (m) =>
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string' &&
+        m.content.trim().length > 0
+    )
+    .map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
 
   if (hasAttachments && opts.attachments) {
+    const userContentParts: Array<Record<string, unknown>> = [];
+
     for (const att of opts.attachments) {
       const mime = (att.mimeType || '').toLowerCase();
       if (mime.startsWith('image/')) {
         userContentParts.push({
-          type: 'image_url',
-          image_url: {
-            url: `data:${att.mimeType};base64,${att.base64Data}`,
-            detail: 'auto',
-          },
+          type: 'input_image',
+          image_url: `data:${att.mimeType};base64,${att.base64Data}`,
+          detail: 'auto',
         });
       } else if (
         mime === 'application/pdf' ||
         att.name.toLowerCase().endsWith('.pdf')
       ) {
         userContentParts.push({
-          type: 'file',
-          file: {
-            filename: att.name || 'document.pdf',
-            file_data: `data:application/pdf;base64,${att.base64Data}`,
-          },
+          type: 'input_file',
+          filename: att.name || 'document.pdf',
+          file_data: `data:application/pdf;base64,${att.base64Data}`,
         });
       } else {
         const decodedText = Buffer.from(att.base64Data, 'base64')
           .toString('utf-8')
           .slice(0, 48_000);
         userContentParts.push({
-          type: 'text',
+          type: 'input_text',
           text: `[Attached Document: ${att.name}]\n\`\`\`\n${decodedText}\n\`\`\``,
         });
       }
     }
+
+    userContentParts.push({
+      type: 'input_text',
+      text: promptText,
+    });
+
+    inputItems.push({
+      role: 'user',
+      content: userContentParts,
+    });
+  } else {
+    inputItems.push({
+      role: 'user',
+      content: promptText,
+    });
   }
 
-  userContentParts.push({
-    type: 'text',
-    text:
-      opts.prompt?.trim() ||
-      'Analyze and summarize the attached document or image thoroughly.',
-  });
-
-  const messages: unknown[] = [
-    {
-      role: isReasoningModel ? 'developer' : 'system',
-      content: systemPrompt,
-    },
-    ...opts.history.slice(-10).map((m) => ({
-      role: m.role,
-      content: m.content,
-    })),
-    {
-      role: 'user',
-      content:
-        userContentParts.length === 1 && userContentParts[0].type === 'text'
-          ? String(userContentParts[0].text)
-          : userContentParts,
-    },
-  ];
-
-  const runOpenAIStream = async (modelToCall: string) => {
+  const runResponsesStream = async (modelToCall: string) => {
     const requestPayload: Record<string, unknown> = {
       model: modelToCall,
-      messages,
+      instructions: systemInstructions,
+      input: inputItems,
       stream: true,
-      stream_options: { include_usage: true },
     };
 
-    if (
-      modelToCall === 'o3' ||
-      modelToCall.startsWith('o3-') ||
-      modelToCall.startsWith('o4-')
-    ) {
-      requestPayload.reasoning_effort = opts.reasoningEffort || 'medium';
-    }
-
-    if (modelToCall.includes('search-preview')) {
-      requestPayload.web_search_options = {
-        search_context_size: 'medium',
+    if (isReasoningModel) {
+      requestPayload.reasoning = {
+        effort: opts.reasoningEffort || 'low',
       };
     }
 
-    const stream = (await openai.chat.completions.create(
-      requestPayload as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming
-    )) as AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
+    if (opts.webSearch) {
+      requestPayload.tools = [{ type: 'web_search_preview' }];
+    }
+
+    const stream = (await openai.responses.create(
+      requestPayload as unknown as OpenAI.Responses.ResponseCreateParamsStreaming
+    )) as AsyncIterable<OpenAI.Responses.ResponseStreamEvent>;
 
     let fullText = '';
     let promptTokens = 0;
     let completionTokens = 0;
+    let resolvedModel = modelToCall;
     const citationMap = new Map<string, GroundingLink>();
 
-    for await (const chunk of stream) {
-      const choice = chunk.choices?.[0];
-      const delta = choice?.delta;
-
-      if (delta?.content) {
-        fullText += delta.content;
-        opts.onDelta(delta.content);
+    const recordCitation = (url?: string, title?: string) => {
+      if (!url) return;
+      let fallbackTitle = url;
+      try {
+        fallbackTitle = new URL(url).hostname;
+      } catch {
+        // keep raw URL
       }
+      citationMap.set(url, {
+        uri: url,
+        title: title || fallbackTitle,
+      });
+    };
 
-      const annotations = (
-        delta as unknown as {
-          annotations?: Array<{
-            type?: string;
-            url_citation?: { url?: string; title?: string };
-          }>;
+    for await (const event of stream) {
+      if (
+        event.type === 'response.output_text.delta' &&
+        typeof event.delta === 'string' &&
+        event.delta.length > 0
+      ) {
+        fullText += event.delta;
+        opts.onDelta(event.delta);
+      } else if (event.type === 'response.output_text.annotation.added') {
+        const ann = (
+          event as unknown as {
+            annotation?: { type?: string; url?: string; title?: string };
+          }
+        ).annotation;
+        if (ann?.url) {
+          recordCitation(ann.url, ann.title);
         }
-      )?.annotations;
-
-      if (Array.isArray(annotations)) {
-        for (const ann of annotations) {
-          const url = ann.url_citation?.url;
-          if (url) {
-            let fallbackTitle = url;
-            try {
-              fallbackTitle = new URL(url).hostname;
-            } catch {
-              // keep raw URL
+      } else if (event.type === 'response.completed') {
+        const resp = event.response;
+        if (resp?.model) {
+          resolvedModel = resp.model;
+        }
+        if (resp?.usage) {
+          promptTokens = resp.usage.input_tokens || 0;
+          completionTokens = resp.usage.output_tokens || 0;
+        }
+        // Fallback text & citation extraction if a completed item contained non-delta output
+        if (Array.isArray(resp?.output)) {
+          for (const outItem of resp.output) {
+            if (outItem.type === 'message' && Array.isArray(outItem.content)) {
+              for (const part of outItem.content) {
+                if (part.type === 'output_text') {
+                  if (!fullText && part.text) {
+                    fullText += part.text;
+                    opts.onDelta(part.text);
+                  }
+                  if (Array.isArray(part.annotations)) {
+                    for (const a of part.annotations) {
+                      const cite = a as unknown as {
+                        url?: string;
+                        title?: string;
+                      };
+                      if (cite.url) {
+                        recordCitation(cite.url, cite.title);
+                      }
+                    }
+                  }
+                }
+              }
             }
-            citationMap.set(url, {
-              uri: url,
-              title: ann.url_citation?.title || fallbackTitle,
-            });
           }
         }
-      }
-
-      if (chunk.usage) {
-        promptTokens = chunk.usage.prompt_tokens || 0;
-        completionTokens = chunk.usage.completion_tokens || 0;
+      } else if (event.type === 'response.failed') {
+        const failMsg =
+          event.response?.error?.message ||
+          'OpenAI Responses API reported a failed generation.';
+        throw new Error(redactSecrets(failMsg));
+      } else if (event.type === 'error') {
+        const errEvt = event as unknown as { message?: string };
+        throw new Error(
+          redactSecrets(errEvt.message || 'OpenAI stream error event.')
+        );
       }
     }
 
@@ -1020,34 +1128,20 @@ async function streamOpenAIChatCompletion(
       citations: Array.from(citationMap.values()),
       promptTokens,
       completionTokens,
-      modelUsed: modelToCall,
+      modelUsed: resolvedModel,
     };
   };
 
   try {
-    let outcome: Awaited<ReturnType<typeof runOpenAIStream>>;
-    try {
-      outcome = await withOverloadRetry(
-        () => runOpenAIStream(targetModel),
-        (e) => formatOpenAIError(e, 'OpenAI Chat Stream')
-      );
-    } catch (primaryErr: unknown) {
-      const status = (primaryErr as { status?: number })?.status;
-      if (
-        opts.webSearch &&
-        targetModel === 'gpt-4o-search-preview' &&
-        (status === 404 || status === 403)
-      ) {
-        outcome = await runOpenAIStream('gpt-4o-mini-search-preview');
-      } else {
-        throw primaryErr;
-      }
-    }
+    const outcome = await withOverloadRetry(
+      () => runResponsesStream(targetModel),
+      (e) => formatOpenAIError(e, 'OpenAI Responses Stream')
+    );
 
     const promptTokens =
       outcome.promptTokens > 0
         ? outcome.promptTokens
-        : Math.ceil((opts.prompt.length + 250) / 4);
+        : Math.ceil((promptText.length + 250) / 4);
     const completionTokens =
       outcome.completionTokens > 0
         ? outcome.completionTokens
@@ -1076,17 +1170,30 @@ async function streamOpenAIChatCompletion(
       providerCostUsd,
     };
   } catch (err: unknown) {
-    throw err instanceof Error
-      ? new Error(redactSecrets(err.message))
-      : formatOpenAIError(err, 'OpenAI Chat Stream');
+    if ((err as { code?: string })?.code === 'OPENAI_SECRET_MISSING') {
+      throw err;
+    }
+    if (err instanceof Error && err.message.startsWith('OpenAI ')) {
+      throw new Error(redactSecrets(err.message));
+    }
+    throw formatOpenAIError(err, 'OpenAI Responses API');
   }
 }
+
+// Smart Circuit Breaker for gemini-3.8-flash upstream stalls/503s:
+// If gemini-3.8-flash stalls (>3.5s) or returns 503/429, bypass directly to gemini-3.1-flash-lite for 3 minutes (0ms wasted wait).
+let gemini38CooldownUntil = 0;
 
 async function streamGeminiChatCompletion(
   opts: StreamChatOptions
 ): Promise<StreamChatResult> {
   const ai = getGeminiClient();
-  const targetModel = resolveAllowedGeminiModel(opts.modelConfig.id);
+  const requestedGeminiModel = resolveAllowedGeminiModel(opts.modelConfig.id);
+  const targetModel =
+    requestedGeminiModel === 'gemini-3.8-flash' &&
+    Date.now() < gemini38CooldownUntil
+      ? 'gemini-3.1-flash-lite'
+      : requestedGeminiModel;
   const systemInstruction = buildSystemInstruction(opts.userFullName);
 
   const contents: Array<{
@@ -1136,17 +1243,28 @@ async function streamGeminiChatCompletion(
 
   let emittedAnyDelta = false;
 
-  const runGeminiStream = async (modelToCall: string, firstTokenTimeoutMs: number) => {
+  const runGeminiStream = async (
+    modelToCall: string,
+    firstTokenTimeoutMs: number
+  ) => {
     const controller = new AbortController();
-    const firstTokenTimer = setTimeout(() => {
-      if (!emittedAnyDelta) {
-        controller.abort(
-          new Error(`Gemini ${modelToCall} first-token timeout after ${firstTokenTimeoutMs}ms`)
-        );
-      }
-    }, firstTokenTimeoutMs);
+    let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
-    try {
+    const firstTokenAbortPromise = new Promise<never>((_, reject) => {
+      watchdogTimer = setTimeout(() => {
+        if (!emittedAnyDelta) {
+          const timeoutErr = new Error(
+            `Gemini ${modelToCall} first-token timeout after ${firstTokenTimeoutMs}ms`
+          );
+          controller.abort(timeoutErr);
+          reject(timeoutErr);
+        }
+      }, firstTokenTimeoutMs);
+    });
+    // Prevent unhandled rejection if stream finishes cleanly before timeout
+    firstTokenAbortPromise.catch(() => {});
+
+    const executeStream = async () => {
       const configObj: Record<string, unknown> = {
         systemInstruction,
         abortSignal: controller.signal,
@@ -1156,28 +1274,60 @@ async function streamGeminiChatCompletion(
         configObj.tools = [{ googleSearch: {} }];
       }
 
-      if (modelToCall === 'gemini-3.8-flash' && opts.reasoningEffort === 'high') {
-        configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.HIGH };
+      if (modelToCall === 'gemini-3.1-flash-lite') {
+        configObj.thinkingConfig = {
+          thinkingLevel:
+            opts.reasoningEffort === 'high'
+              ? ThinkingLevel.MEDIUM
+              : opts.reasoningEffort === 'medium'
+              ? ThinkingLevel.LOW
+              : ThinkingLevel.MINIMAL,
+        };
       } else if (modelToCall === 'gemini-3.8-flash') {
-        configObj.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        configObj.thinkingConfig = {
+          thinkingLevel:
+            opts.reasoningEffort === 'high'
+              ? ThinkingLevel.HIGH
+              : opts.reasoningEffort === 'medium'
+              ? ThinkingLevel.MEDIUM
+              : ThinkingLevel.LOW,
+        };
+      } else if (
+        modelToCall === 'gemini-flash-latest' &&
+        (!opts.reasoningEffort || opts.reasoningEffort === 'low')
+      ) {
+        configObj.thinkingConfig = { thinkingBudget: 0 };
       }
 
-      const responseStream = await ai.models.generateContentStream({
-        model: modelToCall,
-        contents,
-        config: configObj,
-      });
+      const responseStream = await Promise.race([
+        ai.models.generateContentStream({
+          model: modelToCall,
+          contents,
+          config: configObj,
+        }),
+        firstTokenAbortPromise,
+      ]);
 
       let fullText = '';
       let promptTokens = 0;
       let completionTokens = 0;
       const citationMap = new Map<string, GroundingLink>();
 
-      for await (const rawChunk of responseStream) {
-        clearTimeout(firstTokenTimer);
-        const chunk = rawChunk as GenerateContentResponse;
+      const iterator = responseStream[Symbol.asyncIterator]();
+      while (true) {
+        const nextStep = emittedAnyDelta
+          ? await iterator.next()
+          : await Promise.race([iterator.next(), firstTokenAbortPromise]);
+
+        if (nextStep.done) break;
+
+        const chunk = nextStep.value as GenerateContentResponse;
         const deltaText = chunk.text;
         if (deltaText) {
+          if (!emittedAnyDelta && watchdogTimer) {
+            clearTimeout(watchdogTimer);
+            watchdogTimer = null;
+          }
           emittedAnyDelta = true;
           fullText += deltaText;
           opts.onDelta(deltaText);
@@ -1211,35 +1361,59 @@ async function streamGeminiChatCompletion(
         completionTokens,
         modelUsed: modelToCall,
       };
+    };
+
+    try {
+      return await executeStream();
     } finally {
-      clearTimeout(firstTokenTimer);
+      if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+      }
     }
   };
 
   try {
-    let outcome: Awaited<ReturnType<typeof runGeminiStream>>;
-    try {
-      outcome = await runGeminiStream(
+    const candidateChain = Array.from(
+      new Set([
         targetModel,
-        targetModel === 'gemini-3.8-flash' ? 10_000 : 22_000
-      );
-    } catch (primaryErr: unknown) {
-      const { status } = extractProviderErrorMeta(primaryErr);
-      const canSameProviderFallback =
-        !emittedAnyDelta &&
-        targetModel !== 'gemini-3.1-flash-lite' &&
-        (isTransientOverload(primaryErr) || status === 429);
+        'gemini-3.1-flash-lite',
+        'gemini-flash-latest',
+      ])
+    );
 
-      if (canSameProviderFallback) {
-        outcome = await withOverloadRetry(
-          () => runGeminiStream('gemini-3.1-flash-lite', 20_000),
-          (e) => formatGeminiError(e, 'Google Gemini Chat Stream')
-        );
-      } else if (!emittedAnyDelta && isTransientOverload(primaryErr)) {
-        outcome = await runGeminiStream(targetModel, 22_000);
-      } else {
-        throw formatGeminiError(primaryErr, 'Google Gemini Chat Stream');
+    let outcome: Awaited<ReturnType<typeof runGeminiStream>> | null = null;
+    let lastGeminiErr: unknown = null;
+
+    for (let i = 0; i < candidateChain.length; i++) {
+      const candidate = candidateChain[i];
+      const timeoutMs =
+        candidate === 'gemini-3.8-flash'
+          ? 3_500
+          : candidate === 'gemini-3.1-flash-lite'
+          ? 5_500
+          : 15_000;
+
+      try {
+        outcome = await runGeminiStream(candidate, timeoutMs);
+        break;
+      } catch (err: unknown) {
+        lastGeminiErr = err;
+        if (candidate === 'gemini-3.8-flash' && isTransientOverload(err)) {
+          gemini38CooldownUntil = Date.now() + 3 * 60_000;
+        }
+        const { status } = extractProviderErrorMeta(err);
+        const retryable =
+          !emittedAnyDelta &&
+          i < candidateChain.length - 1 &&
+          (isTransientOverload(err) || status === 429 || status === 400);
+        if (!retryable) {
+          throw formatGeminiError(err, 'Google Gemini Chat Stream');
+        }
       }
+    }
+
+    if (!outcome) {
+      throw formatGeminiError(lastGeminiErr, 'Google Gemini Chat Stream');
     }
 
     const promptTokens =
@@ -1692,18 +1866,20 @@ export async function testOpenAIConnection(): Promise<{
   }
 
   try {
-    const openai = new OpenAI({ apiKey: rawKey });
+    const openai = getOpenAIClient();
+    const envModel = (process.env.OPENAI_MODEL || '').trim();
     const pingModel =
+      envModel ||
       discovery.categorizedModels.economical[0] ||
       discovery.categorizedModels.standard[0] ||
       'gpt-4o-mini';
 
-    const ping = await openai.chat.completions.create({
+    const ping = await openai.responses.create({
       model: pingModel,
-      messages: [{ role: 'user', content: 'Reply with OK' }],
-      max_tokens: 4,
+      input: 'Reply with OK',
+      max_output_tokens: 16,
     });
-    const reply = ping.choices?.[0]?.message?.content?.trim() || 'OK';
+    const reply = (ping.output_text || 'OK').trim();
 
     const allTarget = [
       ...discovery.categorizedModels.reasoning,
@@ -1721,7 +1897,7 @@ export async function testOpenAIConnection(): Promise<{
       keyLength: rawKey.length,
       status: 200,
       errorCode: null,
-      message: `Connected to official OpenAI API (${discovery.totalModelsCount} total models accessible; ping "${reply}" via ${pingModel}).`,
+      message: `Connected to official OpenAI Responses API (${discovery.totalModelsCount} total models accessible; ping "${reply}" via ${pingModel}).`,
       latencyMs: Date.now() - startedAt,
       availableTargetModels: allTarget,
       categorizedModels: discovery.categorizedModels,
