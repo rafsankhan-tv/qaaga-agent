@@ -84,7 +84,12 @@ export function redactSecrets(input: string): string {
 
 export function isOpenAIConfigured(): boolean {
   const key = getServerOpenAIKey();
-  return Boolean(key && !PLACEHOLDER_KEYS.has(key));
+  return Boolean(
+    key &&
+      !PLACEHOLDER_KEYS.has(key) &&
+      key.startsWith('sk-') &&
+      key.length >= 20
+  );
 }
 
 export function isGeminiConfigured(): boolean {
@@ -325,21 +330,23 @@ async function refreshOpenAIDiscoveryNow(
   discovery: OpenAIAccountDiscoveryDTO;
   rawModelIds: Set<string>;
 }> {
-  if (!rawKey || PLACEHOLDER_KEYS.has(rawKey)) {
+  if (!isOpenAIConfigured()) {
+    const hasSomeValue = Boolean(rawKey && !PLACEHOLDER_KEYS.has(rawKey));
     const empty: OpenAIAccountDiscoveryDTO = {
       checkedAt: new Date().toISOString(),
       keyPresent: false,
       reachable: false,
-      status: null,
-      errorCode: 'missing_api_key',
-      message:
-        'OPENAI_API_KEY is not set in server environment variables. Configure it in Settings > Secrets to unlock OpenAI models.',
+      status: hasSomeValue ? 401 : null,
+      errorCode: hasSomeValue ? 'invalid_api_key_format' : 'missing_api_key',
+      message: hasSomeValue
+        ? 'The current OPENAI_API_KEY in Settings > Secrets is incomplete or invalid (must be a full sk-... / sk-proj-... / sk-svcacct-... key).'
+        : 'OPENAI_API_KEY is not set in server environment variables. Configure it in Settings > Secrets to unlock OpenAI models.',
       totalModelsCount: 0,
       categorizedModels: emptyCategorizedModels(),
     };
     cachedDiscovery = {
       keyFingerprint: fp,
-      expiresAt: Date.now() + 300_000,
+      expiresAt: Date.now() + 60_000,
       data: empty,
       rawModelIds: new Set(),
     };
@@ -357,7 +364,12 @@ async function refreshOpenAIDiscoveryNow(
 
     const categorized: OpenAIAccountDiscoveryDTO['categorizedModels'] = {
       reasoning: pick(['o3', 'o4-mini', 'o3-mini', 'o1', 'o1-pro', 'o1-mini']),
-      standard: pick(['gpt-4.1', 'gpt-4o', 'gpt-4.5-preview', 'chatgpt-4o-latest']),
+      standard: pick([
+        'gpt-4.1',
+        'gpt-4o',
+        'gpt-4.5-preview',
+        'chatgpt-4o-latest',
+      ]),
       economical: pick(['gpt-4.1-mini', 'gpt-4o-mini', 'gpt-4.1-nano']),
       image: pick(['gpt-image-1', 'dall-e-3', 'dall-e-2']),
       audio: pick([
@@ -395,6 +407,57 @@ async function refreshOpenAIDiscoveryNow(
     return { discovery: data, rawModelIds: rawSet };
   } catch (err: unknown) {
     const { status, errorCode } = extractProviderErrorMeta(err);
+
+    // Service Account keys (sk-svcacct-...) may restrict api.model.read (HTTP 403) while allowing Responses API calls
+    if (status === 403) {
+      try {
+        const openai = getOpenAIClient();
+        const probeModel = getDefaultServerOpenAIModel();
+        await openai.responses.create({
+          model: probeModel,
+          input: 'OK',
+          max_output_tokens: 16,
+        });
+        const assumedIds = [
+          probeModel,
+          'gpt-4o-mini',
+          'gpt-4o',
+          'gpt-4.1-mini',
+          'gpt-4.1',
+          'o4-mini',
+          'o3-mini',
+        ];
+        const rawSet = new Set(assumedIds);
+        const svcData: OpenAIAccountDiscoveryDTO = {
+          checkedAt: new Date().toISOString(),
+          keyPresent: true,
+          reachable: true,
+          status: 200,
+          errorCode: null,
+          message: `Verified OpenAI Service Account key via Responses API (${probeModel}).`,
+          totalModelsCount: rawSet.size,
+          categorizedModels: {
+            reasoning: ['o4-mini', 'o3-mini'],
+            standard: ['gpt-4.1', 'gpt-4o'],
+            economical: ['gpt-4.1-mini', 'gpt-4o-mini'],
+            image: ['dall-e-3'],
+            audio: ['whisper-1', 'tts-1'],
+            realtime: [],
+            search: ['gpt-4o-mini-search-preview', 'gpt-4o-search-preview'],
+          },
+        };
+        cachedDiscovery = {
+          keyFingerprint: fp,
+          expiresAt: Date.now() + 300_000,
+          data: svcData,
+          rawModelIds: rawSet,
+        };
+        return { discovery: svcData, rawModelIds: rawSet };
+      } catch {
+        // Fall through to standard error reporting
+      }
+    }
+
     const formatted = formatOpenAIError(err, 'OpenAI Account Discovery');
     const failed: OpenAIAccountDiscoveryDTO = {
       checkedAt: new Date().toISOString(),
@@ -408,7 +471,7 @@ async function refreshOpenAIDiscoveryNow(
     };
     cachedDiscovery = {
       keyFingerprint: fp,
-      expiresAt: Date.now() + 180_000,
+      expiresAt: Date.now() + 60_000,
       data: failed,
       rawModelIds: new Set(),
     };

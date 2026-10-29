@@ -230,9 +230,13 @@ function QaagaAppShell() {
   );
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
 
-  const loadFrontpageMeta = useCallback(async () => {
+  const loadFrontpageMeta = useCallback(async (forceRefresh = false) => {
     try {
-      const r = await fetch('/api/public/frontpage');
+      const r = await fetch(
+        forceRefresh
+          ? '/api/public/frontpage?refresh=1'
+          : '/api/public/frontpage'
+      );
       if (!r.ok) return null;
       const data = await r.json();
       if (data && data.config && data.packages) {
@@ -354,12 +358,15 @@ function QaagaAppShell() {
     }
   }, [authFetch]);
 
-  const fetchWorkspace = useCallback(async () => {
-    if (!token) return null;
-    setWorkspaceError(null);
-    try {
-      const res = await authFetch('/api/workspace');
-      const data = await res.json();
+  const fetchWorkspace = useCallback(
+    async (forceRefresh = false) => {
+      if (!token) return null;
+      setWorkspaceError(null);
+      try {
+        const res = await authFetch(
+          forceRefresh ? '/api/workspace?refresh=1' : '/api/workspace'
+        );
+        const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || 'Failed to load workspace.');
       }
@@ -546,9 +553,9 @@ function QaagaAppShell() {
 
   const handleRefreshOpenAISecretStatus = useCallback(async () => {
     setStreamError(null);
-    await loadFrontpageMeta();
+    await loadFrontpageMeta(true);
     if (token) {
-      await fetchWorkspace();
+      await fetchWorkspace(true);
     }
   }, [fetchWorkspace, loadFrontpageMeta, token]);
 

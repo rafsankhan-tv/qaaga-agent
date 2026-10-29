@@ -227,12 +227,13 @@ async function startServer() {
   });
 
   // Public Front-Page Hydrator (Models, Recharge Plans & Capabilities for Unauthenticated Visitors)
-  app.get('/api/public/frontpage', async (_req, res) => {
+  app.get('/api/public/frontpage', async (req, res) => {
     try {
       await ensureSeeded();
+      const forceRefresh = req.query.refresh === '1';
       const rawConfig = await getPlatformConfig();
       const { enrichedConfig, capabilities } =
-        await enrichConfigWithLiveAvailability(rawConfig);
+        await enrichConfigWithLiveAvailability(rawConfig, forceRefresh);
       const packages = await getActivePackages();
       res.json({
         config: enrichedConfig,
@@ -558,6 +559,7 @@ async function startServer() {
   app.get('/api/workspace', requireAuth, async (req: AuthRequest, res) => {
     try {
       const authUser = req.authUser!;
+      const forceRefresh = req.query.refresh === '1';
       const [
         enrichedPair,
         packages,
@@ -567,7 +569,9 @@ async function startServer() {
         rawMessages,
         userNotifs,
       ] = await Promise.all([
-        getPlatformConfig().then((rc) => enrichConfigWithLiveAvailability(rc)),
+        getPlatformConfig().then((rc) =>
+          enrichConfigWithLiveAvailability(rc, forceRefresh)
+        ),
         getActivePackages(),
         computeUserCredits(authUser.id, authUser.dailyCreditLimit),
         db
