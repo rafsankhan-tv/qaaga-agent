@@ -212,22 +212,25 @@ export function ChatWorkspaceView({
     (m) => m.enabled
   );
   const selectableModels = [
-    ...enabledModels.filter((m) => m.provider === 'openai'),
-    ...enabledModels.filter((m) => m.provider !== 'openai'),
+    ...enabledModels.filter(
+      (m) => m.provider === 'openai' && m.available !== false
+    ),
+    ...enabledModels.filter(
+      (m) => m.provider !== 'openai' && m.available !== false
+    ),
+    ...enabledModels.filter((m) => m.available === false),
   ];
 
   const activeModelConfig =
     selectableModels.find((m) => m.id === selectedModelId) ||
-    selectableModels.find((m) => m.id === workspace.defaultOpenAIModel) ||
-    selectableModels.find((m) => m.provider === 'openai') ||
     selectableModels[0] ||
     workspace.config.models[0];
 
   const showOpenAISecretSetup =
-    (activeModelConfig?.provider === 'openai' || !activeModelConfig) &&
+    activeModelConfig?.provider === 'openai' &&
     (!workspace.capabilities.openaiConfigured || missingOpenAISecret);
 
-  const compactModelName = (activeModelConfig?.label || 'GPT-4o mini')
+  const compactModelName = (activeModelConfig?.label || 'QAAGA Flash')
     .replace(/\s*\(.*?\)\s*/g, '')
     .trim();
 
@@ -600,7 +603,12 @@ export function ChatWorkspaceView({
                               {m.label}
                             </p>
                             <p className="text-[11px] text-slate-400 font-mono tabular-nums">
-                              {m.baseCreditCost} cr · {m.provider === 'openai' ? 'OpenAI' : 'Gemini'}
+                              {m.baseCreditCost} cr ·{' '}
+                              {m.provider === 'openai' ? 'OpenAI' : 'Gemini'}
+                              {m.provider === 'openai' &&
+                              !workspace.capabilities.openaiConfigured
+                                ? ' · Needs OPENAI_API_KEY'
+                                : ''}
                             </p>
                           </div>
                           {selected && (

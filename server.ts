@@ -304,6 +304,21 @@ async function startServer() {
 
       const { enrichedConfig } = await enrichConfigWithLiveAvailability(rawConfig);
 
+      const explicitRequestedModel = enrichedConfig.models.find(
+        (m) => m.id === modelId && m.enabled
+      );
+      if (
+        explicitRequestedModel?.provider === 'openai' &&
+        !isOpenAIConfigured()
+      ) {
+        res.status(503).json({
+          code: 'OPENAI_SECRET_MISSING',
+          error:
+            'OPENAI_API_KEY is not configured on the server. Replace the placeholder OPENAI_API_KEY in AI Studio Settings > Secrets to use OpenAI models.',
+        });
+        return;
+      }
+
       const liveAvailableModels = enrichedConfig.models.filter(
         (m) => m.enabled && m.available !== false
       );
@@ -315,7 +330,9 @@ async function startServer() {
         enrichedConfig.models[0];
 
       const chosenModel =
-        liveAvailableModels.find((m) => m.id === modelId) || fastGuestDefault;
+        explicitRequestedModel ||
+        liveAvailableModels.find((m) => m.id === modelId) ||
+        fastGuestDefault;
 
       const safeHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
         Array.isArray(history)

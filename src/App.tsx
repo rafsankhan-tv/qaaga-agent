@@ -210,9 +210,11 @@ function QaagaAppShell() {
   } | null>(null);
   const initializedForUserIdRef = useRef<number | null>(null);
 
-  // Active Chat State (Defaults to server-configurable OpenAI model; never falls back silently to Gemini)
+  // Active Chat State
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [selectedModelId, setSelectedModelId] = useState<string>('gpt-4o-mini');
+  const [selectedModelId, setSelectedModelId] = useState<string>(
+    'gemini-3.1-flash-lite'
+  );
   const [reasoningEffort, setReasoningEffort] = useState<
     'low' | 'medium' | 'high'
   >('low');
@@ -256,18 +258,28 @@ function QaagaAppShell() {
         const enabledModels = (data.config as PlatformConfigDTO).models.filter(
           (m) => m.enabled
         );
-        const preferredOpenAI =
-          enabledModels.find(
-            (m) => m.id === serverModel && m.provider === 'openai'
-          ) ||
-          enabledModels.find((m) => m.provider === 'openai') ||
-          enabledModels[0];
+        const liveModels = enabledModels.filter((m) => m.available !== false);
 
-        if (preferredOpenAI) {
+        if (caps.openaiLiveVerified) {
+          const preferredOpenAI =
+            liveModels.find(
+              (m) => m.id === serverModel && m.provider === 'openai'
+            ) ||
+            liveModels.find((m) => m.provider === 'openai') ||
+            liveModels[0];
+          if (preferredOpenAI) {
+            setSelectedModelId((prev) =>
+              liveModels.some((m) => m.id === prev && m.provider === 'openai')
+                ? prev
+                : preferredOpenAI.id
+            );
+          }
+        } else if (liveModels.length > 0) {
+          const fastLive =
+            liveModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+            liveModels[0];
           setSelectedModelId((prev) =>
-            enabledModels.some((m) => m.id === prev)
-              ? prev
-              : preferredOpenAI.id
+            liveModels.some((m) => m.id === prev) ? prev : fastLive.id
           );
         }
         return data;
@@ -376,23 +388,37 @@ function QaagaAppShell() {
       setMissingOpenAISecret(!payload.capabilities.openaiConfigured);
       setSelectedModelId((prev) => {
         const enabled = payload.config.models.filter((m) => m.enabled);
+        const live = enabled.filter((m) => m.available !== false);
         const serverModel = payload.defaultOpenAIModel || 'gpt-4o-mini';
-        if (enabled.some((m) => m.id === prev)) return prev;
-        if (
-          enabled.some(
-            (m) =>
-              m.id === payload.user.preferredModel && m.provider === 'openai'
-          )
-        ) {
+
+        if (payload.capabilities.openaiLiveVerified) {
+          if (live.some((m) => m.id === prev && m.provider === 'openai')) {
+            return prev;
+          }
+          if (
+            live.some(
+              (m) =>
+                m.id === payload.user.preferredModel && m.provider === 'openai'
+            )
+          ) {
+            return payload.user.preferredModel;
+          }
+          const openAiLive =
+            live.find((m) => m.id === serverModel && m.provider === 'openai') ||
+            live.find((m) => m.provider === 'openai') ||
+            live[0];
+          return openAiLive?.id || serverModel;
+        }
+
+        if (live.some((m) => m.id === prev)) return prev;
+        if (live.some((m) => m.id === payload.user.preferredModel)) {
           return payload.user.preferredModel;
         }
-        const openAiDefault =
-          enabled.find(
-            (m) => m.id === serverModel && m.provider === 'openai'
-          ) ||
-          enabled.find((m) => m.provider === 'openai') ||
+        const fastLive =
+          live.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+          live[0] ||
           enabled[0];
-        return openAiDefault?.id || serverModel;
+        return fastLive?.id || 'gemini-3.1-flash-lite';
       });
 
       if (payload.user.role === 'admin' && payload.user.status === 'ACTIVE') {
@@ -559,28 +585,27 @@ function QaagaAppShell() {
     }
   }, [fetchWorkspace, loadFrontpageMeta, token]);
 
-  // Unauthenticated Chat Submit Handler — POST /api/chat is protected by user authentication
+  // Front-Page Guest Free Text Chat Executor (Non-chat commands prompt Login; explicit OpenAI without key shows Secret Setup)
   const executeGuestStreamChat = async (opts?: {
     customPrompt?: string;
     regenerateLast?: boolean;
   }) => {
-    const promptToSend = (
-      opts?.customPrompt !== undefined ? opts.customPrompt : chatInput
-    ).trim();
+    let promptToSend =
+      opts?.customPrompt !== undefined ? opts.customPrompt : chatInput;
 
-    if (!promptToSend) return;
+    let historySnapshot = guestMessages;
 
-    if (opts?.customPrompt !== undefined) {
-      setChatInput(promptToSend);
+    if (opts?.regenerateLast) {
+      const reversedUserIdx = [...guestMessages]
+        .reverse()
+        .findIndex((m) => m.role === 'user');
+      if (reversedUserIdx === -1) return;
+      const lastUserIdx = guestMessages.length - 1 - reversedUserIdx;
+      promptToSend = guestMessages[lastUserIdx].content;
+      historySnapshot = guestMessages.slice(0, lastUserIdx);
     }
 
-    if (!publicMeta.capabilities.openaiConfigured) {
-      setMissingOpenAISecret(true);
-      setStreamError(
-        'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to start chatting.'
-      );
-      return;
-    }
+    if (!promptToSend.trim()) return;
 
     const detected = detectNonChatCommand(promptToSend);
     if (detected.isNonChat || webSearchEnabled || uploads.length > 0) {
@@ -588,8 +613,168 @@ function QaagaAppShell() {
       return;
     }
 
-    // POST /api/chat is protected by user authentication & per-user rate limits
-    openLoginModal('OpenAI Chat', 'chat');
+    const chosenGuestModel = publicMeta.config.models.find(
+      (m) => m.id === selectedModelId
+    );
+    if (chosenGuestModel?.provider === 'openai') {
+      if (!publicMeta.capabilities.openaiConfigured) {
+        setMissingOpenAISecret(true);
+        setStreamError(
+          'OPENAI_API_KEY is not configured on the server. Replace the placeholder OPENAI_API_KEY in AI Studio Settings > Secrets, or switch to a live model.'
+        );
+        return;
+      }
+      // OpenAI POST /api/chat is protected by user authentication & per-user rate limits
+      setChatInput(promptToSend.trim());
+      openLoginModal('OpenAI Chat', 'chat');
+      return;
+    }
+
+    const userMsg: ChatMessageDTO = {
+      id: Date.now(),
+      sessionId: -1,
+      role: 'user',
+      content: promptToSend.trim(),
+      model: selectedModelId,
+      mode: 'chat',
+      attachments: [],
+      citations: [],
+      imageDataUrl: null,
+      creditsCharged: 0,
+      tokensUsed: 0,
+      createdAt: new Date().toISOString(),
+    };
+
+    const updatedHistory = [...historySnapshot, userMsg];
+    setGuestMessages(updatedHistory);
+    if (opts?.customPrompt === undefined && !opts?.regenerateLast) {
+      setChatInput('');
+    }
+
+    setIsStreaming(true);
+    setStreamingText('');
+    setStreamError(null);
+
+    let finalReplyText = '';
+
+    try {
+      const res = await fetch('/api/public/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: promptToSend.trim(),
+          modelId: selectedModelId,
+          reasoningEffort,
+          webSearch: false,
+          attachments: [],
+          history: historySnapshot.slice(-10).map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+        }),
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        if (res.status === 401 || errJson.code === 'LOGIN_REQUIRED') {
+          setGuestMessages(historySnapshot);
+          setChatInput(promptToSend);
+          openLoginModal('Advanced AI Command', 'chat');
+          return;
+        }
+        if (res.status === 503 && errJson.code === 'OPENAI_SECRET_MISSING') {
+          setGuestMessages(historySnapshot);
+          setChatInput(promptToSend);
+          setMissingOpenAISecret(true);
+          setStreamError(errJson.error || 'OPENAI_API_KEY is missing.');
+          return;
+        }
+        throw new Error(errJson.error || 'Guest chat request failed.');
+      }
+
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('Streaming unavailable.');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const processGuestFrame = (frame: string) => {
+        const line = frame
+          .split('\n')
+          .find((l) => l.startsWith('data: '));
+        if (!line) return;
+
+        let event: { type?: string; text?: string; error?: string } | null =
+          null;
+        try {
+          event = JSON.parse(line.slice(6));
+        } catch {
+          return;
+        }
+        if (!event) return;
+
+        if (event.type === 'delta' && event.text) {
+          finalReplyText += String(event.text);
+          setStreamingText(finalReplyText);
+        } else if (event.type === 'error') {
+          throw new Error(event.error || 'Guest chat streaming error.');
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) {
+            for (const trailing of buffer.split('\n\n')) {
+              processGuestFrame(trailing);
+            }
+          }
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+
+        for (const frame of parts) {
+          processGuestFrame(frame);
+        }
+      }
+
+      if (finalReplyText.trim()) {
+        const assistantMsg: ChatMessageDTO = {
+          id: Date.now() + 1,
+          sessionId: -1,
+          role: 'assistant',
+          content: finalReplyText,
+          model: selectedModelId,
+          mode: 'chat',
+          attachments: [],
+          citations: [],
+          imageDataUrl: null,
+          creditsCharged: 0,
+          tokensUsed: 0,
+          createdAt: new Date().toISOString(),
+        };
+        setGuestMessages((prev) => [...prev, assistantMsg]);
+      } else {
+        throw new Error(
+          'Empty response received. Please try sending your message again.'
+        );
+      }
+    } catch (err: unknown) {
+      if (!finalReplyText.trim()) {
+        setGuestMessages(historySnapshot);
+        setChatInput(promptToSend);
+      }
+      setStreamError(
+        err instanceof Error ? err.message : 'Guest chat interrupted.'
+      );
+    } finally {
+      setIsStreaming(false);
+      setStreamingText('');
+    }
   };
 
   // Suspended Account Gate (Only SUSPENDED accounts are locked out; PENDING/0-credit accounts enter workspace & see Recharge prompt on commands)
