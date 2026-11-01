@@ -216,11 +216,11 @@ export function AdminConsoleViews({
 
   const exportUsersCsv = () => {
     const header =
-      'ID,Full Name,Email,Role,Status,Expired,Assigned Credits,Used Credits,Remaining Credits,Daily Limit,Used Today,OpenAI USD,Gemini USD,Total API USD,Chat,Image,PDF,Search,Voice\n';
+      'ID,Full Name,Email,Role,Status,Expired,Assigned Credits,Used Credits,Remaining Credits,Daily Limit,Used Today,OpenAI USD,Total API USD,Chat,Image,PDF,Search,Voice\n';
     const rows = dashboard.users
       .map(
         (u) =>
-          `${u.id},"${u.fullName}",${u.email},${u.role},${u.status},${u.isExpired},${u.creditsAssigned},${u.creditsUsed},${u.creditsRemaining},${u.dailyCreditLimit},${u.usedTodayCredits},${(u.openaiUsdCost ?? 0).toFixed(6)},${(u.geminiUsdCost ?? 0).toFixed(6)},${(u.totalUsdCost ?? 0).toFixed(6)},${u.chatCredits},${u.imageCredits},${u.pdfCredits},${u.searchCredits},${u.voiceCredits}`
+          `${u.id},"${u.fullName}",${u.email},${u.role},${u.status},${u.isExpired},${u.creditsAssigned},${u.creditsUsed},${u.creditsRemaining},${u.dailyCreditLimit},${u.usedTodayCredits},${(u.openaiUsdCost ?? 0).toFixed(6)},${(u.totalUsdCost ?? 0).toFixed(6)},${u.chatCredits},${u.imageCredits},${u.pdfCredits},${u.searchCredits},${u.voiceCredits}`
       )
       .join('\n');
     downloadCsv('qaaga-users-report.csv', header + rows);
@@ -823,8 +823,7 @@ export function AdminConsoleViews({
       : 0;
 
   const totalProviderUsd = kpis.totalProviderUsedUsd ?? kpis.openaiUsedUsd;
-  const todayProviderUsd =
-    (kpis.openaiTodayUsd ?? 0) + (kpis.geminiTodayUsd ?? 0);
+  const todayProviderUsd = kpis.todayProviderUsedUsd ?? kpis.openaiTodayUsd ?? 0;
   const spendPct =
     kpis.monthlySpendLimitUsd > 0
       ? Math.round((totalProviderUsd / kpis.monthlySpendLimitUsd) * 100)
@@ -1002,10 +1001,8 @@ export function AdminConsoleViews({
           <div className="rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 px-4 py-3 text-xs text-amber-800 dark:text-amber-200 flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>
-              <strong>API Spend Alert:</strong> Total provider spend ($
-              {totalProviderUsd.toFixed(4)} USD · OpenAI $
-              {kpis.openaiUsedUsd.toFixed(4)} · Gemini $
-              {(kpis.geminiUsedUsd ?? 0).toFixed(4)}) is at {spendPct}% of your
+              <strong>OpenAI Spend Alert:</strong> Total OpenAI API spend ($
+              {totalProviderUsd.toFixed(4)} USD) is at {spendPct}% of your
               monthly cap (${kpis.monthlySpendLimitUsd.toFixed(2)}) and{' '}
               {dailySpendPct}% of your daily cap ($
               {(kpis.dailySpendLimitUsd ?? 15).toFixed(2)}).
@@ -1124,8 +1121,7 @@ export function AdminConsoleViews({
               </span>
             </div>
             <p className="text-[10px] font-mono text-slate-500 mt-0.5 truncate">
-              OAI ${kpis.openaiUsedUsd.toFixed(2)} · Gem $
-              {(kpis.geminiUsedUsd ?? 0).toFixed(2)}
+              Gemini + OpenAI · Today ${todayProviderUsd.toFixed(2)}
             </p>
           </button>
 
@@ -1857,7 +1853,7 @@ export function AdminConsoleViews({
                   <th className="py-3 px-4">User</th>
                   <th className="py-3 px-3">Status & Expiry</th>
                   <th className="py-3 px-3 text-right">Assigned / Used / Rem</th>
-                  <th className="py-3 px-3 text-right">API Cost (OAI / Gem)</th>
+                  <th className="py-3 px-3 text-right">OpenAI Cost (USD)</th>
                   <th className="py-3 px-3 text-right">
                     Chat · Img · PDF · Web · Voice
                   </th>
@@ -1911,8 +1907,7 @@ export function AdminConsoleViews({
 
                     <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
                       <div className="font-semibold text-slate-900 dark:text-white">
-                        ${(u.openaiUsdCost ?? 0).toFixed(4)} / $
-                        {(u.geminiUsdCost ?? 0).toFixed(4)}
+                        ${(u.openaiUsdCost ?? 0).toFixed(4)}
                       </div>
                       <div className="text-[10.5px] text-slate-400">
                         {u.apiRequests ?? 0} req ·{' '}
@@ -2476,10 +2471,10 @@ export function AdminConsoleViews({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-              API Usage & Multi-Provider Telemetry
+              Google Gemini & OpenAI API Usage Telemetry
             </h1>
             <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-              Monitor OpenAI API USD spending and Google Gemini API USD spending separately alongside per-user consumption.
+              Monitor Google Gemini and OpenAI API USD spending, token consumption, and per-user credit usage.
             </p>
           </div>
           <button
@@ -2492,10 +2487,19 @@ export function AdminConsoleViews({
           </button>
         </div>
 
-        {/* Separate OpenAI vs Gemini Spend Summary */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {/* Provider Spend & Cap Summary */}
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
-            <p className="text-xs text-slate-500">OpenAI API Spending (USD)</p>
+            <p className="text-xs text-slate-500">Google Gemini Spend (USD)</p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-blue-600 dark:text-blue-400 mt-1">
+              ${(kpis.googleUsedUsd ?? 0).toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.googleTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">OpenAI Total Spend (USD)</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-700 dark:text-emerald-400 mt-1">
               ${kpis.openaiUsedUsd.toFixed(4)}
             </p>
@@ -2505,25 +2509,25 @@ export function AdminConsoleViews({
           </div>
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
             <p className="text-xs text-slate-500">
-              Google Gemini API Spending (USD)
+              Combined Today Spend (USD)
             </p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-sky-600 dark:text-sky-400 mt-1">
-              ${(kpis.geminiUsedUsd ?? 0).toFixed(4)}
+              ${todayProviderUsd.toFixed(4)}
             </p>
             <p className="text-[11px] font-mono text-slate-400 mt-0.5">
-              Today: ${(kpis.geminiTodayUsd ?? 0).toFixed(4)} USD
+              {kpis.totalTokensUsed.toLocaleString()} total tokens metered
             </p>
           </div>
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
             <p className="text-xs text-slate-500">
-              Combined Provider Spend & Caps
+              Spend Caps & Budget
             </p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-slate-900 dark:text-white mt-1">
-              ${totalProviderUsd.toFixed(4)}
+              ${kpis.openaiRemainingEstimatedUsd.toFixed(2)} rem
             </p>
             <p className="text-[11px] font-mono text-slate-400 mt-0.5">
-              Daily Cap ${(kpis.dailySpendLimitUsd ?? 15).toFixed(2)} · Monthly
-              Cap ${kpis.monthlySpendLimitUsd.toFixed(2)}
+              Monthly Cap ${kpis.monthlySpendLimitUsd.toFixed(2)} · Daily $
+              {(kpis.dailySpendLimitUsd ?? 15).toFixed(2)}
             </p>
           </div>
         </div>
@@ -2579,7 +2583,7 @@ export function AdminConsoleViews({
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
           <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
             <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-              Individual User API Consumption (OpenAI vs Gemini)
+              Individual User OpenAI API Consumption
             </h2>
             <span className="text-xs font-mono text-slate-400">
               {usersSortedBySpend.length} accounts
@@ -2594,8 +2598,6 @@ export function AdminConsoleViews({
                   <th className="py-2.5 px-3 text-right">Requests</th>
                   <th className="py-2.5 px-3 text-right">Tokens</th>
                   <th className="py-2.5 px-3 text-right">OpenAI (USD)</th>
-                  <th className="py-2.5 px-3 text-right">Gemini (USD)</th>
-                  <th className="py-2.5 px-3 text-right">Total API (USD)</th>
                   <th className="py-2.5 px-4 text-right">Credits Used</th>
                 </tr>
               </thead>
@@ -2617,14 +2619,8 @@ export function AdminConsoleViews({
                     <td className="py-2.5 px-3 text-right font-mono tabular-nums">
                       {(u.totalTokens ?? 0).toLocaleString()}
                     </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
+                    <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-emerald-700 dark:text-emerald-400">
                       ${(u.openaiUsdCost ?? 0).toFixed(4)}
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono tabular-nums text-sky-600 dark:text-sky-400">
-                      ${(u.geminiUsdCost ?? 0).toFixed(4)}
-                    </td>
-                    <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-slate-900 dark:text-white">
-                      ${(u.totalUsdCost ?? 0).toFixed(4)}
                     </td>
                     <td className="py-2.5 px-4 text-right font-mono font-bold tabular-nums text-emerald-600">
                       {u.creditsUsed} cr
@@ -2644,20 +2640,30 @@ export function AdminConsoleViews({
    * ======================================================================== */
   if (section === 'admin-openai-billing') {
     const providerErrors = dashboard.providerErrors ?? [];
+    const activeGoogleDiag = providerDiagResult?.google;
     const activeOpenAIDiag = providerDiagResult?.openai || openAITestResult;
 
     return (
       <div className="max-w-5xl mx-auto w-full px-4 sm:px-6 py-6 space-y-6">
         <div>
           <h1 className="font-heading font-extrabold text-2xl text-slate-900 dark:text-white">
-            Provider API Billing, Spend Caps & Connectivity
+            AI Provider Billing, Spend Caps & Connectivity (Google Gemini + OpenAI)
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-            {kpis.walletSourceLabel} · Separate OpenAI & Google Gemini USD tracking with daily and monthly hard caps.
+            {kpis.walletSourceLabel} · Real-time Google Gemini & OpenAI USD tracking with daily and monthly hard caps.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
+            <p className="text-xs text-slate-500">Google Gemini Spend (USD)</p>
+            <p className="text-2xl font-mono font-extrabold tabular-nums text-blue-600 dark:text-blue-400 mt-1">
+              ${(kpis.googleUsedUsd ?? 0).toFixed(4)}
+            </p>
+            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
+              Today: ${(kpis.googleTodayUsd ?? 0).toFixed(4)} USD
+            </p>
+          </div>
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
             <p className="text-xs text-slate-500">OpenAI API Spend (USD)</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-700 dark:text-emerald-400 mt-1">
@@ -2668,16 +2674,7 @@ export function AdminConsoleViews({
             </p>
           </div>
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
-            <p className="text-xs text-slate-500">Gemini API Spend (USD)</p>
-            <p className="text-2xl font-mono font-extrabold tabular-nums text-sky-600 dark:text-sky-400 mt-1">
-              ${(kpis.geminiUsedUsd ?? 0).toFixed(4)}
-            </p>
-            <p className="text-[11px] font-mono text-slate-400 mt-0.5">
-              Today: ${(kpis.geminiTodayUsd ?? 0).toFixed(4)} USD
-            </p>
-          </div>
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
-            <p className="text-xs text-slate-500">Purchased OpenAI Budget</p>
+            <p className="text-xs text-slate-500">Purchased Budget</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-slate-900 dark:text-white mt-1">
               ${kpis.openaiPurchasedUsd.toFixed(2)}
             </p>
@@ -2686,7 +2683,7 @@ export function AdminConsoleViews({
             </p>
           </div>
           <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4">
-            <p className="text-xs text-slate-500">OpenAI Balance (Est.)</p>
+            <p className="text-xs text-slate-500">Remaining Balance (Est.)</p>
             <p className="text-2xl font-mono font-extrabold tabular-nums text-emerald-600 mt-1">
               ${kpis.openaiRemainingEstimatedUsd.toFixed(4)}
             </p>
@@ -2786,20 +2783,28 @@ export function AdminConsoleViews({
 
           <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-4 space-y-3 text-xs text-slate-600 dark:text-slate-300">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="space-y-0.5">
+              <div className="space-y-1">
+                <div>
+                  <strong>Google Gemini API Status:</strong>{' '}
+                  {capabilities.googleLiveVerified
+                    ? 'Live Verified (GEMINI_API_KEY Active · @google/genai)'
+                    : capabilities.googleConfigured
+                    ? `GEMINI_API_KEY Present · Unverified (${
+                        capabilities.googleDiscovery?.message ||
+                        'Check GEMINI_API_KEY in Settings > Secrets'
+                      })`
+                    : 'GEMINI_API_KEY Not Set in Server Environment'}
+                </div>
                 <div>
                   <strong>OpenAI API Status:</strong>{' '}
                   {capabilities.openaiLiveVerified
-                    ? 'Live Verified (OPENAI_API_KEY Active · Strict Provider Isolation)'
+                    ? 'Live Verified (OPENAI_API_KEY Active)'
                     : capabilities.openaiConfigured
                     ? `OPENAI_API_KEY Present · Unverified (${
                         capabilities.openaiDiscovery?.message ||
-                        'Check API key in Settings > Secrets'
+                        'Check OPENAI_API_KEY in Settings > Secrets'
                       })`
                     : 'OPENAI_API_KEY Not Set in Server Environment'}
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Note: OpenAI API model access depends on your API organization tier & prepaid API credits, not consumer ChatGPT Plus/Pro subscriptions.
                 </div>
               </div>
               {(onTestProviders || onTestOpenAI) && (
@@ -2830,11 +2835,44 @@ export function AdminConsoleViews({
                   <span>
                     {testingOpenAI
                       ? 'Testing Providers...'
-                      : 'Test OpenAI & Gemini Connectivity'}
+                      : 'Test AI Providers Connectivity'}
                   </span>
                 </button>
               )}
             </div>
+
+            {activeGoogleDiag && (
+              <div
+                className={`rounded-xl border p-3 space-y-1.5 ${
+                  activeGoogleDiag.ok
+                    ? 'bg-blue-50/70 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800 text-blue-900 dark:text-blue-200'
+                    : 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                  <span>
+                    {activeGoogleDiag.ok
+                      ? 'Google Gemini API Live Connection Verified'
+                      : `Google Gemini API Connection Failed${
+                          activeGoogleDiag.status
+                            ? ` (HTTP ${activeGoogleDiag.status})`
+                            : ''
+                        }`}
+                  </span>
+                  <span className="font-mono text-[11px]">
+                    {activeGoogleDiag.latencyMs} ms
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed">
+                  {activeGoogleDiag.message}
+                </p>
+                {activeGoogleDiag.availableTargetModels.length > 0 && (
+                  <p className="font-mono text-[11px] opacity-90">
+                    Models: {activeGoogleDiag.availableTargetModels.join(', ')}
+                  </p>
+                )}
+              </div>
+            )}
 
             {activeOpenAIDiag && (
               <div
@@ -2899,36 +2937,6 @@ export function AdminConsoleViews({
                 )}
               </div>
             )}
-
-            {providerDiagResult?.gemini && (
-              <div
-                className={`rounded-xl border p-3 space-y-1.5 ${
-                  providerDiagResult.gemini.ok
-                    ? 'bg-sky-50/70 dark:bg-sky-950/30 border-sky-200 dark:border-sky-800 text-sky-900 dark:text-sky-200'
-                    : 'bg-rose-50/70 dark:bg-rose-950/30 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
-                }`}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2 font-semibold">
-                  <span>
-                    {providerDiagResult.gemini.ok
-                      ? 'Google Gemini API Live Connection Verified'
-                      : 'Google Gemini API Connection Failed'}
-                  </span>
-                  <span className="font-mono text-[11px]">
-                    {providerDiagResult.gemini.latencyMs} ms
-                  </span>
-                </div>
-                <p className="text-xs leading-relaxed">
-                  {providerDiagResult.gemini.message}
-                </p>
-                {providerDiagResult.gemini.availableModels.length > 0 && (
-                  <p className="font-mono text-[11px] opacity-90">
-                    Available Gemini Models:{' '}
-                    {providerDiagResult.gemini.availableModels.join(', ')}
-                  </p>
-                )}
-              </div>
-            )}
           </div>
 
           <div className="flex justify-end items-center gap-3">
@@ -2957,10 +2965,10 @@ export function AdminConsoleViews({
           <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
             <div>
               <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-                Provider Connectivity & API Error Log
+                OpenAI Connectivity & API Error Log
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Every failed OpenAI or Gemini call is logged here with sanitized error details and triggers an automatic 100% user credit refund.
+                Every failed OpenAI API call is logged here with sanitized error details and triggers an automatic 100% user credit refund.
               </p>
             </div>
             <span className="text-xs font-mono text-slate-400">
@@ -3342,10 +3350,10 @@ export function AdminConsoleViews({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-              OpenAI & Google Gemini Model Catalog, Pricing & Credit Rates
+              Google Gemini & OpenAI Model Catalog, Pricing & Credit Rates
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Enable or disable models, set user credit charges per request/1K tokens, and configure provider USD rates. End users only see models that are both Enabled and Live Available.
+              Enable or disable Google Gemini and OpenAI models, set user credit charges per request/1K tokens, and configure USD rates.
             </p>
           </div>
         </div>
@@ -3366,9 +3374,9 @@ export function AdminConsoleViews({
                     <span className="font-mono text-slate-400">({m.id})</span>
                     <span
                       className={`px-1.5 py-0.5 rounded font-mono text-[10px] uppercase font-bold ${
-                        m.provider === 'openai'
-                          ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
-                          : 'bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-300'
+                        m.provider === 'google'
+                          ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
+                          : 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300'
                       }`}
                     >
                       {m.provider}

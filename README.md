@@ -10,8 +10,8 @@ Copy `.env.example` to `.env` (or configure secrets in your Cloud Run / hosting 
 
 | Variable | Purpose |
 | :--- | :--- |
-| `OPENAI_API_KEY` | Server-side OpenAI API key (never exposed to browser). Powers live `gpt-4o`, `gpt-4o-mini`, `o3-mini`, `dall-e-3`, `whisper-1`, and `tts-1`. |
-| `GEMINI_API_KEY` | Optional server-side multimodal bridge when `OPENAI_API_KEY` is not yet configured. |
+| `OPENAI_API_KEY` | Server-side OpenAI API key (never exposed to browser). Powers live `gpt-4o`, `gpt-4o-mini`, `o3-mini`, `dall-e-3`, `whisper-1`, `tts-1`, and `gpt-4o-mini-realtime-preview`. |
+| `OPENAI_MODEL` | Configurable default server-side OpenAI model (defaults to `gpt-4o-mini`). |
 | `SQL_HOST` | PostgreSQL / Cloud SQL Auth Proxy socket or host (Object Method). |
 | `SQL_DB_NAME` | PostgreSQL database name. |
 | `SQL_USER` / `SQL_PASSWORD` | Application runtime database credentials (read/write). |
@@ -66,5 +66,5 @@ On first launch, QAAGA AGENT idempotently seeds reference accounts so you can te
 | **30-Day Carry-Forward Recharge** | **Fully Functional** | Manual `bKash`, `Nagad`, and `Rocket` submission (`20 / 50 / 100 / 200 BDT`) with TrxID uniqueness check, private screenshot upload, admin approval/rejection, credit carry-forward, and 30-day validity reset. |
 | **Admin Financial & Usage Console** | **Fully Functional** | BDT revenue, separate USD provider cost tracking, admin-reconciled wallet estimate, Recharts daily/feature analytics, CSV exports, model/tool switches, announcements, and audit logs. |
 | **HTTP 503 Overload Resilience** | **Fully Functional** | Automatic exponential backoff retry and secondary model failover protect chat, image, STT, and TTS calls during transient provider overload. |
-| **Direct OpenAI API Billing** | **Ready for `OPENAI_API_KEY`** | Uses official `openai` SDK on the server when `OPENAI_API_KEY` is set; transparently uses labeled Sandbox Bridge / Demo Mode when `OPENAI_API_KEY` is unconfigured. |
+| **Direct OpenAI API Billing** | **OpenAI-Only (`OPENAI_API_KEY`)** | Uses the official `openai` SDK (`POST /api/chat` via OpenAI Responses API) strictly from `process.env.OPENAI_API_KEY` with zero mock responses or external fallbacks. |
 

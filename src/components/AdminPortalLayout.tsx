@@ -297,7 +297,7 @@ export function AdminPortalLayout({
                 className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 cursor-pointer whitespace-nowrap"
               >
                 <span className="truncate max-w-[160px]">
-                  {activeModel?.id || 'gpt-4o'}
+                  {activeModel?.id || 'gpt-4o-mini'}
                 </span>
                 <span className="text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
                   · Default
@@ -322,8 +322,11 @@ export function AdminPortalLayout({
                           {m.label}
                         </div>
                         <div className="text-[11px] font-mono text-slate-500 tabular-nums">
-                          {m.provider === 'openai' ? 'OpenAI' : 'Gemini'} · Base{' '}
-                          {m.baseCreditCost} cr · ${m.inputUsdPer1M}/1M in
+                          {m.provider === 'google'
+                            ? 'Google Gemini'
+                            : 'OpenAI'}{' '}
+                          · Base {m.baseCreditCost} cr · ${m.inputUsdPer1M}/1M
+                          in
                         </div>
                       </div>
                       {m.id === activeModel?.id && (

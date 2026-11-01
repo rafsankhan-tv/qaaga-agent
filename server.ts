@@ -43,21 +43,25 @@ import {
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import { requireAdmin, requireAuth } from './src/middleware/auth.ts';
 import type { AuthRequest } from './src/middleware/auth.ts';
+import { Modality } from '@google/genai';
 import {
   calculateInternalCreditCharge,
-  connectGeminiLiveVoiceSession,
   enrichConfigWithLiveAvailability,
   extractProviderErrorMeta,
   generateImageAsset,
+  getDefaultServerGoogleModel,
   getDefaultServerOpenAIModel,
+  getGoogleGenAIClient,
   getOpenAIRealtimeAuthHeaders,
+  GOOGLE_PRICING_USD_PER_1M,
+  isGoogleConfigured,
   isOpenAIConfigured,
   OPENAI_PRICING_USD_PER_1M,
   redactSecrets,
   streamChatCompletion,
-  streamOpenAIResponsesChat,
   synthesizeSpeechAudio,
   testAllProvidersConnection,
+  testGoogleConnection,
   testOpenAIConnection,
   transcribeAudioBuffer,
 } from './src/services/aiProvider.ts';
@@ -72,12 +76,29 @@ import type {
 
 dotenv.config();
 
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled async rejection (kept server alive):', reason);
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function resolveServerPort(): number {
+  const portFlagIdx = process.argv.indexOf('--port');
+  if (portFlagIdx !== -1 && process.argv[portFlagIdx + 1]) {
+    const parsed = Number(process.argv[portFlagIdx + 1]);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return Number(process.env.PORT) || 3000;
+}
+
 async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+  const PORT = resolveServerPort();
+
+  app.get('/healthz', (_req, res) => {
+    res.status(200).json({ ok: true });
+  });
 
   app.use(express.json({ limit: '25mb' }));
 
@@ -239,6 +260,7 @@ async function startServer() {
         config: enrichedConfig,
         packages,
         capabilities,
+        defaultGoogleModel: getDefaultServerGoogleModel(enrichedConfig),
         defaultOpenAIModel: getDefaultServerOpenAIModel(enrichedConfig),
       });
     } catch (error: unknown) {
@@ -302,37 +324,61 @@ async function startServer() {
         return;
       }
 
-      const { enrichedConfig } = await enrichConfigWithLiveAvailability(rawConfig);
-
-      const explicitRequestedModel = enrichedConfig.models.find(
-        (m) => m.id === modelId && m.enabled
-      );
-      if (
-        explicitRequestedModel?.provider === 'openai' &&
-        !isOpenAIConfigured()
-      ) {
+      if (!isGoogleConfigured() && !isOpenAIConfigured()) {
         res.status(503).json({
-          code: 'OPENAI_SECRET_MISSING',
+          code: 'AI_SECRET_MISSING',
           error:
-            'OPENAI_API_KEY is not configured on the server. Replace the placeholder OPENAI_API_KEY in AI Studio Settings > Secrets to use OpenAI models.',
+            'Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured on the server. Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets.',
         });
         return;
       }
 
+      const { enrichedConfig } = await enrichConfigWithLiveAvailability(rawConfig);
+      const serverGoogleDefault = getDefaultServerGoogleModel(enrichedConfig);
+      const serverOpenAIDefault = getDefaultServerOpenAIModel(enrichedConfig);
+
+      const explicitRequestedModel = enrichedConfig.models.find(
+        (m) => m.id === modelId && m.enabled
+      );
       const liveAvailableModels = enrichedConfig.models.filter(
         (m) => m.enabled && m.available !== false
       );
       const fastGuestDefault =
-        liveAvailableModels.find((m) => m.id === 'gpt-4o-mini') ||
+        liveAvailableModels.find((m) => m.id === serverGoogleDefault) ||
+        liveAvailableModels.find((m) => m.id === serverOpenAIDefault) ||
         liveAvailableModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+        liveAvailableModels.find((m) => m.id === 'gpt-4o-mini') ||
         liveAvailableModels[0] ||
         enrichedConfig.models.find((m) => m.enabled) ||
         enrichedConfig.models[0];
 
-      const chosenModel =
+      const fallbackIsGoogle = isGoogleConfigured();
+      const fallbackModelId = fallbackIsGoogle
+        ? serverGoogleDefault
+        : serverOpenAIDefault;
+
+      const chosenModel: ModelConfigItem =
         explicitRequestedModel ||
         liveAvailableModels.find((m) => m.id === modelId) ||
-        fastGuestDefault;
+        fastGuestDefault || {
+          id: fallbackModelId,
+          label: fallbackIsGoogle
+            ? `Google Gemini (${fallbackModelId})`
+            : `OpenAI (${fallbackModelId})`,
+          provider: fallbackIsGoogle ? 'google' : 'openai',
+          tier: fallbackIsGoogle ? 'google-economical' : 'openai-economical',
+          category: 'chat',
+          enabled: true,
+          inputUsdPer1M: fallbackIsGoogle
+            ? GOOGLE_PRICING_USD_PER_1M[fallbackModelId]?.input ?? 0.075
+            : OPENAI_PRICING_USD_PER_1M[fallbackModelId]?.input ?? 0.15,
+          outputUsdPer1M: fallbackIsGoogle
+            ? GOOGLE_PRICING_USD_PER_1M[fallbackModelId]?.output ?? 0.3
+            : OPENAI_PRICING_USD_PER_1M[fallbackModelId]?.output ?? 0.6,
+          baseCreditCost: 1,
+          creditsPer1kTokens: 1,
+          description: 'Server-side AI streaming model',
+        };
 
       const safeHistory: Array<{ role: 'user' | 'assistant'; content: string }> =
         Array.isArray(history)
@@ -365,7 +411,11 @@ async function startServer() {
       }, 5000);
       res.on('close', () => clearInterval(heartbeatTimer));
 
-      sendSSE({ type: 'meta', model: chosenModel.id });
+      sendSSE({
+        type: 'meta',
+        model: chosenModel.id,
+        provider: chosenModel.provider,
+      });
 
       try {
         const result = await streamChatCompletion({
@@ -384,6 +434,7 @@ async function startServer() {
           type: 'done',
           tokensUsed: result.totalTokens,
           modelUsed: result.modelUsed,
+          providerUsed: result.providerUsed,
         });
         clearInterval(heartbeatTimer);
         res.end();
@@ -393,10 +444,7 @@ async function startServer() {
         await recordProviderApiError({
           actorUserId: null,
           actorEmail: 'guest@qaaga.ai',
-          provider:
-            chosenModel.provider === 'gemini' || chosenModel.provider === 'bridge'
-              ? 'gemini'
-              : 'openai',
+          provider: chosenModel.provider,
           model: chosenModel.id,
           feature: 'guest_chat',
           status: errMeta.status,
@@ -405,10 +453,11 @@ async function startServer() {
         });
         sendSSE({
           type: 'error',
-          error:
+          error: redactSecrets(
             streamErr instanceof Error
               ? streamErr.message
-              : 'Guest chat streaming failed.',
+              : 'Guest chat streaming failed.'
+          ),
         });
         res.end();
       }
@@ -678,6 +727,7 @@ async function startServer() {
         })),
         config,
         capabilities,
+        defaultGoogleModel: getDefaultServerGoogleModel(config),
         defaultOpenAIModel: getDefaultServerOpenAIModel(config),
       });
     } catch (error: unknown) {
@@ -947,668 +997,305 @@ async function startServer() {
     }
   );
 
-  // 9A. Official OpenAI Responses API Chat Endpoint (Authenticated + Per-User Rate Limited)
-  app.post(
-    '/api/chat',
-    requireAuth,
-    perUserChatLimiter,
-    async (req: AuthRequest, res) => {
-      const authUser = req.authUser!;
-      const {
-        sessionId,
-        prompt,
-        modelId,
-        webSearch,
-        reasoningEffort,
-        attachments,
-        regenerateLast,
-        history: clientHistory,
-      }: {
-        sessionId?: number | null;
-        prompt?: string;
-        modelId?: string;
-        webSearch?: boolean;
-        reasoningEffort?: 'low' | 'medium' | 'high';
-        regenerateLast?: boolean;
-        history?: Array<{ role?: string; content?: string }>;
-        attachments?: Array<{
-          name: string;
-          mimeType: string;
-          sizeBytes: number;
-          base64Data: string;
-          previewDataUrl?: string;
-        }>;
-      } = req.body || {};
+  // 9. Official OpenAI Responses API Chat Endpoint (Authenticated + Per-User Rate Limited)
+  const handleAuthenticatedOpenAIChat = async (
+    req: AuthRequest,
+    res: express.Response
+  ) => {
+    const authUser = req.authUser!;
+    const {
+      sessionId,
+      prompt,
+      modelId,
+      webSearch,
+      reasoningEffort,
+      attachments,
+      regenerateLast,
+      history: clientHistory,
+    }: {
+      sessionId?: number | null;
+      prompt?: string;
+      modelId?: string;
+      webSearch?: boolean;
+      reasoningEffort?: 'low' | 'medium' | 'high';
+      regenerateLast?: boolean;
+      history?: Array<{ role?: string; content?: string }>;
+      attachments?: Array<{
+        name: string;
+        mimeType: string;
+        sizeBytes: number;
+        base64Data: string;
+        previewDataUrl?: string;
+      }>;
+    } = req.body || {};
 
-      const cleanPrompt = String(prompt || '').trim();
-      const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+    const cleanPrompt = String(prompt || '').trim();
+    const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
 
-      if (!regenerateLast && !cleanPrompt && !hasAttachments) {
-        res.status(400).json({
-          code: 'EMPTY_PROMPT',
-          error: 'Please enter a message or attach a file before sending.',
-        });
-        return;
-      }
-
-      // Strictly require process.env.OPENAI_API_KEY — never mock and never silently fall back to Gemini
-      if (!isOpenAIConfigured()) {
-        res.status(503).json({
-          code: 'OPENAI_SECRET_MISSING',
-          error:
-            'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to enable OpenAI chat.',
-        });
-        return;
-      }
-
-      try {
-        const rawConfig = await getPlatformConfig();
-        try {
-          await enforcePlatformSpendCaps(rawConfig);
-        } catch (capErr: unknown) {
-          res.status(403).json({
-            error:
-              capErr instanceof Error
-                ? redactSecrets(capErr.message)
-                : 'Platform API spending limit reached.',
-          });
-          return;
-        }
-
-        const { enrichedConfig: config } =
-          await enrichConfigWithLiveAvailability(rawConfig);
-
-        // Resolve server-configurable OpenAI model (process.env.OPENAI_MODEL -> Admin-enabled OpenAI model -> gpt-4o-mini)
-        const serverDefaultModelId = getDefaultServerOpenAIModel(config);
-        const requestedClean = String(modelId || '').trim();
-
-        const matchedConfiguredOpenAI = config.models.find(
-          (m) =>
-            m.id === requestedClean &&
-            m.provider === 'openai' &&
-            m.enabled
-        );
-        const defaultConfiguredOpenAI =
-          config.models.find(
-            (m) =>
-              m.id === serverDefaultModelId &&
-              m.provider === 'openai' &&
-              m.enabled
-          ) ||
-          config.models.find((m) => m.provider === 'openai' && m.enabled);
-
-        const chosenModel: ModelConfigItem =
-          matchedConfiguredOpenAI ||
-          (requestedClean &&
-          /^(gpt-|o1|o3|o4|chatgpt-)/i.test(requestedClean)
-            ? {
-                id: requestedClean,
-                label: requestedClean,
-                provider: 'openai',
-                tier:
-                  requestedClean.startsWith('o')
-                    ? 'openai-reasoning'
-                    : requestedClean.includes('mini') ||
-                      requestedClean.includes('nano')
-                    ? 'openai-economical'
-                    : 'openai-standard',
-                enabled: true,
-                category: requestedClean.startsWith('o') ? 'reasoning' : 'chat',
-                baseCreditCost: config.creditRates.chatBase || 1,
-                creditsPer1kTokens: config.creditRates.chatPer1kTokens || 1,
-                inputUsdPer1M:
-                  OPENAI_PRICING_USD_PER_1M[requestedClean]?.input ?? 0.15,
-                outputUsdPer1M:
-                  OPENAI_PRICING_USD_PER_1M[requestedClean]?.output ?? 0.6,
-                description: 'Server-configured OpenAI Responses API model',
-              }
-            : defaultConfiguredOpenAI &&
-              defaultConfiguredOpenAI.id === serverDefaultModelId
-            ? defaultConfiguredOpenAI
-            : {
-                id: serverDefaultModelId,
-                label:
-                  defaultConfiguredOpenAI?.label ||
-                  `OpenAI (${serverDefaultModelId})`,
-                provider: 'openai',
-                tier: 'openai-economical',
-                enabled: true,
-                category: 'chat',
-                baseCreditCost:
-                  defaultConfiguredOpenAI?.baseCreditCost ??
-                  config.creditRates.chatBase ??
-                  1,
-                creditsPer1kTokens:
-                  defaultConfiguredOpenAI?.creditsPer1kTokens ??
-                  config.creditRates.chatPer1kTokens ??
-                  1,
-                inputUsdPer1M:
-                  OPENAI_PRICING_USD_PER_1M[serverDefaultModelId]?.input ?? 0.15,
-                outputUsdPer1M:
-                  OPENAI_PRICING_USD_PER_1M[serverDefaultModelId]?.output ?? 0.6,
-                description: 'Server-configured OpenAI Responses API model',
-              });
-
-        const hasPdf = Boolean(
-          attachments?.some((a) => !a.mimeType.startsWith('image/'))
-        );
-        const hasImage = Boolean(
-          attachments?.some((a) => a.mimeType.startsWith('image/'))
-        );
-
-        if (hasPdf && !config.toolsEnabled.pdfAnalysis) {
-          res.status(403).json({
-            error:
-              'Document/PDF analysis is currently disabled by administrator.',
-          });
-          return;
-        }
-        if (hasImage && !config.toolsEnabled.imageAnalysis) {
-          res.status(403).json({
-            error: 'Image analysis is currently disabled by administrator.',
-          });
-          return;
-        }
-        if (webSearch && !config.toolsEnabled.webSearch) {
-          res.status(403).json({
-            error: 'Web Search is currently disabled by administrator.',
-          });
-          return;
-        }
-
-        const featureCategory: 'chat' | 'image' | 'pdf' | 'search' = hasPdf
-          ? 'pdf'
-          : hasImage
-          ? 'image'
-          : webSearch
-          ? 'search'
-          : 'chat';
-
-        const baseReserve =
-          featureCategory === 'pdf'
-            ? config.creditRates.pdfAnalysis
-            : featureCategory === 'image'
-            ? config.creditRates.imageAnalysis
-            : featureCategory === 'search'
-            ? config.creditRates.webSearch
-            : chosenModel.baseCreditCost || config.creditRates.chatBase;
-
-        const per1kTokenRate =
-          chosenModel.creditsPer1kTokens ?? config.creditRates.chatPer1kTokens;
-
-        const reserveAmount = baseReserve + 2;
-        const reservation = await reserveCreditsForUsage({
-          userId: authUser.id,
-          feature: featureCategory,
-          reserveAmount,
-          description: `${chosenModel.label} (${featureCategory})`,
-        });
-
-        let targetSessionId =
-          sessionId && Number(sessionId) > 0 ? Number(sessionId) : null;
-
-        if (targetSessionId) {
-          const [ownedSess] = await db
-            .select()
-            .from(chatSessions)
-            .where(
-              and(
-                eq(chatSessions.id, targetSessionId),
-                eq(chatSessions.userId, authUser.id)
-              )
-            );
-          if (!ownedSess) {
-            targetSessionId = null;
-          }
-        }
-
-        const isBrandNewSession = !targetSessionId;
-        let insertedUserMsgId: number | null = null;
-        let effectivePrompt = cleanPrompt;
-        let historyForModel: Array<{
-          role: 'user' | 'assistant';
-          content: string;
-        }> = [];
-
-        if (!targetSessionId) {
-          const [createdSess] = await db
-            .insert(chatSessions)
-            .values({
-              userId: authUser.id,
-              title: (
-                effectivePrompt ||
-                attachments?.[0]?.name ||
-                'New Conversation'
-              ).slice(0, 60),
-              model: chosenModel.id,
-              mode: featureCategory,
-            })
-            .returning();
-          targetSessionId = createdSess.id;
-        }
-
-        if (regenerateLast && targetSessionId) {
-          const existingMsgs = await db
-            .select()
-            .from(chatMessages)
-            .where(eq(chatMessages.sessionId, targetSessionId))
-            .orderBy(asc(chatMessages.id));
-
-          let remainingMsgs = existingMsgs;
-          const lastMsg = existingMsgs[existingMsgs.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant') {
-            await db
-              .delete(chatMessages)
-              .where(eq(chatMessages.id, lastMsg.id));
-            remainingMsgs = existingMsgs.slice(0, -1);
-            const prevUser = existingMsgs[existingMsgs.length - 2];
-            if (prevUser && !effectivePrompt) {
-              effectivePrompt = prevUser.content;
-            }
-          }
-          historyForModel = remainingMsgs.slice(0, -1).map((m) => ({
-            role: (m.role as 'user' | 'assistant') || 'user',
-            content: m.content,
-          }));
-        } else {
-          // Load existing session history BEFORE inserting the new user message when clientHistory is omitted
-          let dbPriorMsgs: Array<{ role: string; content: string }> = [];
-          const hasClientHistory =
-            Array.isArray(clientHistory) && clientHistory.length > 0;
-
-          if (!isBrandNewSession && !hasClientHistory) {
-            dbPriorMsgs = await db
-              .select({
-                role: chatMessages.role,
-                content: chatMessages.content,
-              })
-              .from(chatMessages)
-              .where(eq(chatMessages.sessionId, targetSessionId))
-              .orderBy(asc(chatMessages.id));
-          }
-
-          const [insertedUserMsg] = await db
-            .insert(chatMessages)
-            .values({
-              sessionId: targetSessionId,
-              userId: authUser.id,
-              role: 'user',
-              content:
-                effectivePrompt ||
-                `Analyze attached file: ${attachments?.[0]?.name || 'file'}`,
-              model: chosenModel.id,
-              mode: featureCategory,
-              attachmentsJson: attachments
-                ? JSON.stringify(
-                    attachments.map((a) => ({
-                      name: a.name,
-                      mimeType: a.mimeType,
-                      sizeBytes: a.sizeBytes,
-                      previewDataUrl: a.previewDataUrl,
-                    }))
-                  )
-                : null,
-            })
-            .returning({ id: chatMessages.id });
-          insertedUserMsgId = insertedUserMsg?.id ?? null;
-
-          if (hasClientHistory) {
-            historyForModel = clientHistory!
-              .filter(
-                (m) =>
-                  (m.role === 'user' || m.role === 'assistant') &&
-                  typeof m.content === 'string' &&
-                  m.content.trim().length > 0
-              )
-              .slice(-16)
-              .map((m) => ({
-                role: m.role as 'user' | 'assistant',
-                content: String(m.content),
-              }));
-          } else if (dbPriorMsgs.length > 0) {
-            historyForModel = dbPriorMsgs
-              .filter((m) => m.role === 'user' || m.role === 'assistant')
-              .slice(-16)
-              .map((m) => ({
-                role: (m.role as 'user' | 'assistant') || 'user',
-                content: m.content,
-              }));
-          }
-        }
-
-        // Start SSE Stream immediately
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.flushHeaders?.();
-
-        const sendSSE = (obj: Record<string, unknown>) => {
-          if (!res.writableEnded) {
-            res.write(`data: ${JSON.stringify(obj)}\n\n`);
-          }
-        };
-
-        const chatHeartbeatTimer = setInterval(() => {
-          if (!res.writableEnded) {
-            res.write(`: heartbeat\n\n`);
-          }
-        }, 5000);
-        res.on('close', () => clearInterval(chatHeartbeatTimer));
-
-        sendSSE({
-          type: 'meta',
-          sessionId: targetSessionId,
-          model: chosenModel.id,
-          provider: 'openai',
-        });
-
-        try {
-          const result = await streamOpenAIResponsesChat({
-            modelConfig: chosenModel,
-            history: historyForModel,
-            prompt: effectivePrompt,
-            webSearch: Boolean(webSearch),
-            reasoningEffort:
-              reasoningEffort &&
-              ['low', 'medium', 'high'].includes(reasoningEffort)
-                ? reasoningEffort
-                : 'low',
-            attachments: attachments?.map((a) => ({
-              name: a.name,
-              mimeType: a.mimeType,
-              base64Data: a.base64Data,
-            })),
-            userFullName: authUser.fullName,
-            onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
-          });
-
-          const actualCredits = calculateInternalCreditCharge(
-            baseReserve,
-            per1kTokenRate,
-            result.totalTokens
-          );
-
-          trackLiveUsdSpend(result.providerCostUsd);
-
-          const [, , [savedAssistant]] = await Promise.all([
-            finalizeCreditReservation({
-              userId: authUser.id,
-              reservationId: reservation.reservationId,
-              reservedAmount: reserveAmount,
-              actualAmount: actualCredits,
-              feature: featureCategory,
-              description: `${result.modelUsed} · ${result.totalTokens} tokens`,
-            }),
-            db.insert(providerUsageLogs).values({
-              userId: authUser.id,
-              provider: 'openai',
-              model: result.modelUsed,
-              feature: featureCategory,
-              promptTokens: result.promptTokens,
-              completionTokens: result.completionTokens,
-              totalTokens: result.totalTokens,
-              providerCostUsd: result.providerCostUsd.toFixed(6),
-              internalCreditsCharged: actualCredits,
-            }),
-            db
-              .insert(chatMessages)
-              .values({
-                sessionId: targetSessionId,
-                userId: authUser.id,
-                role: 'assistant',
-                content: result.fullText || 'Completed.',
-                model: result.modelUsed,
-                mode: featureCategory,
-                citationsJson:
-                  result.citations.length > 0
-                    ? JSON.stringify(result.citations)
-                    : null,
-                creditsCharged: actualCredits,
-                tokensUsed: result.totalTokens,
-                providerCostUsd: result.providerCostUsd.toFixed(6),
-              })
-              .returning(),
-            db
-              .update(chatSessions)
-              .set({ updatedAt: new Date() })
-              .where(eq(chatSessions.id, targetSessionId)),
-          ]);
-
-          sendSSE({
-            type: 'done',
-            sessionId: targetSessionId,
-            messageId: savedAssistant.id,
-            creditsCharged: actualCredits,
-            tokensUsed: result.totalTokens,
-            providerUsed: 'openai',
-            modelUsed: result.modelUsed,
-            citations: result.citations,
-          });
-          clearInterval(chatHeartbeatTimer);
-          res.end();
-        } catch (streamErr: unknown) {
-          clearInterval(chatHeartbeatTimer);
-          // 100% Atomic Refund on OpenAI API Failure + remove orphaned failed turn
-          await finalizeCreditReservation({
-            userId: authUser.id,
-            reservationId: reservation.reservationId,
-            reservedAmount: reserveAmount,
-            actualAmount: 0,
-            feature: featureCategory,
-            description: 'OpenAI API failure refund',
-          });
-          if (insertedUserMsgId) {
-            await db
-              .delete(chatMessages)
-              .where(eq(chatMessages.id, insertedUserMsgId))
-              .catch(() => undefined);
-          }
-          if (isBrandNewSession && targetSessionId) {
-            await db
-              .delete(chatSessions)
-              .where(eq(chatSessions.id, targetSessionId))
-              .catch(() => undefined);
-          }
-          const errMeta = extractProviderErrorMeta(streamErr);
-          await recordProviderApiError({
-            actorUserId: authUser.id,
-            actorEmail: authUser.email,
-            provider: 'openai',
-            model: chosenModel.id,
-            feature: featureCategory,
-            status: errMeta.status,
-            errorCode: errMeta.errorCode,
-            safeMessage: errMeta.safeMessage,
-          });
-          sendSSE({
-            type: 'error',
-            code: errMeta.errorCode || 'OPENAI_API_ERROR',
-            error: redactSecrets(
-              streamErr instanceof Error
-                ? streamErr.message
-                : 'OpenAI Responses API request failed.'
-            ),
-          });
-          res.end();
-        }
-      } catch (outerError: unknown) {
-        sendCommandError(
-          res,
-          outerError,
-          'Unable to start OpenAI chat response.'
-        );
-      }
+    if (!regenerateLast && !cleanPrompt && !hasAttachments) {
+      res.status(400).json({
+        code: 'EMPTY_PROMPT',
+        error: 'Please enter a message or attach a file before sending.',
+      });
+      return;
     }
-  );
 
-  // 9B. Multi-Provider Streaming AI Chat (Used when explicit Gemini model is chosen)
-  app.post(
-    '/api/chat/stream',
-    requireAuth,
-    aiLimiter,
-    async (req: AuthRequest, res) => {
-      const authUser = req.authUser!;
-      const {
-        sessionId,
-        prompt,
-        modelId,
-        webSearch,
-        reasoningEffort,
-        attachments,
-        regenerateLast,
-        history: clientHistory,
-      }: {
-        sessionId?: number | null;
-        prompt?: string;
-        modelId?: string;
-        webSearch?: boolean;
-        reasoningEffort?: 'low' | 'medium' | 'high';
-        regenerateLast?: boolean;
-        history?: Array<{ role?: string; content?: string }>;
-        attachments?: Array<{
-          name: string;
-          mimeType: string;
-          sizeBytes: number;
-          base64Data: string;
-          previewDataUrl?: string;
-        }>;
-      } = req.body || {};
+    if (!isGoogleConfigured() && !isOpenAIConfigured()) {
+      res.status(503).json({
+        code: 'AI_SECRET_MISSING',
+        error:
+          'Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured on the server. Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets.',
+      });
+      return;
+    }
 
+    try {
+      const rawConfig = await getPlatformConfig();
       try {
-        const rawConfig = await getPlatformConfig();
-        try {
-          await enforcePlatformSpendCaps(rawConfig);
-        } catch (capErr: unknown) {
-          res.status(403).json({
-            error:
-              capErr instanceof Error
-                ? capErr.message
-                : 'Platform API spending limit reached.',
-          });
-          return;
-        }
-
-        const { enrichedConfig: config } =
-          await enrichConfigWithLiveAvailability(rawConfig);
-
-        // Honor explicit modelId if enabled (allows direct provider calls & testing), otherwise default to first available enabled model
-        const chosenModel =
-          config.models.find((m) => m.id === modelId && m.enabled) ||
-          config.models.find((m) => m.enabled && m.available !== false) ||
-          config.models.find((m) => m.enabled) ||
-          config.models[0];
-
-        if (!chosenModel || !chosenModel.enabled) {
-          res.status(400).json({
-            error: 'Selected model is currently disabled by administrator.',
-          });
-          return;
-        }
-
-        const hasPdf = Boolean(
-          attachments?.some((a) => !a.mimeType.startsWith('image/'))
-        );
-        const hasImage = Boolean(
-          attachments?.some((a) => a.mimeType.startsWith('image/'))
-        );
-
-        if (hasPdf && !config.toolsEnabled.pdfAnalysis) {
-          res.status(403).json({
-            error: 'Document/PDF analysis is currently disabled by administrator.',
-          });
-          return;
-        }
-        if (hasImage && !config.toolsEnabled.imageAnalysis) {
-          res.status(403).json({
-            error: 'Image analysis is currently disabled by administrator.',
-          });
-          return;
-        }
-        if (webSearch && !config.toolsEnabled.webSearch) {
-          res.status(403).json({
-            error: 'Web Search is currently disabled by administrator.',
-          });
-          return;
-        }
-
-        const featureCategory: 'chat' | 'image' | 'pdf' | 'search' = hasPdf
-          ? 'pdf'
-          : hasImage
-          ? 'image'
-          : webSearch
-          ? 'search'
-          : 'chat';
-
-        const baseReserve =
-          featureCategory === 'pdf'
-            ? config.creditRates.pdfAnalysis
-            : featureCategory === 'image'
-            ? config.creditRates.imageAnalysis
-            : featureCategory === 'search'
-            ? config.creditRates.webSearch
-            : chosenModel.baseCreditCost || config.creditRates.chatBase;
-
-        const per1kTokenRate =
-          chosenModel.creditsPer1kTokens ?? config.creditRates.chatPer1kTokens;
-
-        // Reserve base + buffer (refunded upon settlement if unused, or 100% refunded on failure)
-        const reserveAmount = baseReserve + 2;
-        const reservation = await reserveCreditsForUsage({
-          userId: authUser.id,
-          feature: featureCategory,
-          reserveAmount,
-          description: `${chosenModel.label} (${featureCategory})`,
+        await enforcePlatformSpendCaps(rawConfig);
+      } catch (capErr: unknown) {
+        res.status(403).json({
+          error:
+            capErr instanceof Error
+              ? redactSecrets(capErr.message)
+              : 'Platform API spending limit reached.',
         });
+        return;
+      }
 
-        let targetSessionId = sessionId ? Number(sessionId) : null;
-        const isBrandNewSession = !targetSessionId;
-        let effectivePrompt = String(prompt || '').trim();
-        let historyForModel: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      const { enrichedConfig: config, capabilities } =
+        await enrichConfigWithLiveAvailability(rawConfig);
 
-        if (!targetSessionId) {
-          const [createdSess] = await db
-            .insert(chatSessions)
-            .values({
-              userId: authUser.id,
-              title: (
-                effectivePrompt ||
-                attachments?.[0]?.name ||
-                'New Conversation'
-              ).slice(0, 60),
-              model: chosenModel.id,
-              mode: featureCategory,
-            })
-            .returning();
-          targetSessionId = createdSess.id;
+      const serverGoogleModelId = getDefaultServerGoogleModel(config);
+      const serverOpenAIModelId = getDefaultServerOpenAIModel(config);
+      const requestedClean = String(modelId || '').trim();
+
+      const matchedConfigured = config.models.find(
+        (m) => m.id === requestedClean && m.enabled
+      );
+      const liveModels = config.models.filter(
+        (m) => m.enabled && m.available !== false
+      );
+      const preferredLiveDefault =
+        liveModels.find((m) => m.id === serverGoogleModelId) ||
+        liveModels.find((m) => m.id === serverOpenAIModelId) ||
+        liveModels[0] ||
+        config.models.find((m) => m.enabled);
+
+      const preferGoogleFallback =
+        capabilities.googleLiveVerified ||
+        (!capabilities.openaiLiveVerified && isGoogleConfigured());
+      const fallbackModelId = preferGoogleFallback
+        ? serverGoogleModelId
+        : serverOpenAIModelId;
+
+      const chosenModel: ModelConfigItem =
+        matchedConfigured ||
+        (requestedClean &&
+        requestedClean.startsWith('gemini-') &&
+        !/^gemini-(1\.5|2\.0|pro)/i.test(requestedClean)
+          ? {
+              id: requestedClean,
+              label: requestedClean,
+              provider: 'google',
+              tier: requestedClean.includes('argon')
+                ? 'google-reasoning'
+                : requestedClean.includes('lite')
+                ? 'google-economical'
+                : 'google-standard',
+              enabled: true,
+              category: requestedClean.includes('argon') ? 'reasoning' : 'chat',
+              baseCreditCost: config.creditRates.chatBase || 1,
+              creditsPer1kTokens: config.creditRates.chatPer1kTokens || 1,
+              inputUsdPer1M:
+                GOOGLE_PRICING_USD_PER_1M[requestedClean]?.input ?? 0.075,
+              outputUsdPer1M:
+                GOOGLE_PRICING_USD_PER_1M[requestedClean]?.output ?? 0.3,
+              description: 'Server-configured Google Gemini model',
+            }
+          : requestedClean && /^(gpt-|o1|o3|o4|chatgpt-)/i.test(requestedClean)
+          ? {
+              id: requestedClean,
+              label: requestedClean,
+              provider: 'openai',
+              tier: requestedClean.startsWith('o')
+                ? 'openai-reasoning'
+                : requestedClean.includes('mini') ||
+                  requestedClean.includes('nano')
+                ? 'openai-economical'
+                : 'openai-standard',
+              enabled: true,
+              category: requestedClean.startsWith('o') ? 'reasoning' : 'chat',
+              baseCreditCost: config.creditRates.chatBase || 1,
+              creditsPer1kTokens: config.creditRates.chatPer1kTokens || 1,
+              inputUsdPer1M:
+                OPENAI_PRICING_USD_PER_1M[requestedClean]?.input ?? 0.15,
+              outputUsdPer1M:
+                OPENAI_PRICING_USD_PER_1M[requestedClean]?.output ?? 0.6,
+              description: 'Server-configured OpenAI Responses API model',
+            }
+          : preferredLiveDefault || {
+              id: fallbackModelId,
+              label: preferGoogleFallback
+                ? `Google Gemini (${fallbackModelId})`
+                : `OpenAI (${fallbackModelId})`,
+              provider: preferGoogleFallback ? 'google' : 'openai',
+              tier: preferGoogleFallback
+                ? 'google-economical'
+                : 'openai-economical',
+              enabled: true,
+              category: 'chat',
+              baseCreditCost: config.creditRates.chatBase ?? 1,
+              creditsPer1kTokens: config.creditRates.chatPer1kTokens ?? 1,
+              inputUsdPer1M: preferGoogleFallback
+                ? GOOGLE_PRICING_USD_PER_1M[fallbackModelId]?.input ?? 0.075
+                : OPENAI_PRICING_USD_PER_1M[fallbackModelId]?.input ?? 0.15,
+              outputUsdPer1M: preferGoogleFallback
+                ? GOOGLE_PRICING_USD_PER_1M[fallbackModelId]?.output ?? 0.3
+                : OPENAI_PRICING_USD_PER_1M[fallbackModelId]?.output ?? 0.6,
+              description: 'Server-configured AI model',
+            });
+
+      const hasPdf = Boolean(
+        attachments?.some((a) => !a.mimeType.startsWith('image/'))
+      );
+      const hasImage = Boolean(
+        attachments?.some((a) => a.mimeType.startsWith('image/'))
+      );
+
+      if (hasPdf && !config.toolsEnabled.pdfAnalysis) {
+        res.status(403).json({
+          error:
+            'Document/PDF analysis is currently disabled by administrator.',
+        });
+        return;
+      }
+      if (hasImage && !config.toolsEnabled.imageAnalysis) {
+        res.status(403).json({
+          error: 'Image analysis is currently disabled by administrator.',
+        });
+        return;
+      }
+      if (webSearch && !config.toolsEnabled.webSearch) {
+        res.status(403).json({
+          error: 'Web Search is currently disabled by administrator.',
+        });
+        return;
+      }
+
+      const featureCategory: 'chat' | 'image' | 'pdf' | 'search' = hasPdf
+        ? 'pdf'
+        : hasImage
+        ? 'image'
+        : webSearch
+        ? 'search'
+        : 'chat';
+
+      const baseReserve =
+        featureCategory === 'pdf'
+          ? config.creditRates.pdfAnalysis
+          : featureCategory === 'image'
+          ? config.creditRates.imageAnalysis
+          : featureCategory === 'search'
+          ? config.creditRates.webSearch
+          : chosenModel.baseCreditCost || config.creditRates.chatBase;
+
+      const per1kTokenRate =
+        chosenModel.creditsPer1kTokens ?? config.creditRates.chatPer1kTokens;
+
+      const reserveAmount = baseReserve + 2;
+      const reservation = await reserveCreditsForUsage({
+        userId: authUser.id,
+        feature: featureCategory,
+        reserveAmount,
+        description: `${chosenModel.label} (${featureCategory})`,
+      });
+
+      let targetSessionId =
+        sessionId && Number(sessionId) > 0 ? Number(sessionId) : null;
+
+      if (targetSessionId) {
+        const [ownedSess] = await db
+          .select()
+          .from(chatSessions)
+          .where(
+            and(
+              eq(chatSessions.id, targetSessionId),
+              eq(chatSessions.userId, authUser.id)
+            )
+          );
+        if (!ownedSess) {
+          targetSessionId = null;
         }
+      }
 
-        // Handle Regenerate Last Assistant Response vs Standard Message Append
-        if (regenerateLast && targetSessionId) {
-          const existingMsgs = await db
-            .select()
+      const isBrandNewSession = !targetSessionId;
+      let insertedUserMsgId: number | null = null;
+      let effectivePrompt = cleanPrompt;
+      let historyForModel: Array<{
+        role: 'user' | 'assistant';
+        content: string;
+      }> = [];
+
+      if (!targetSessionId) {
+        const [createdSess] = await db
+          .insert(chatSessions)
+          .values({
+            userId: authUser.id,
+            title: (
+              effectivePrompt ||
+              attachments?.[0]?.name ||
+              'New Conversation'
+            ).slice(0, 60),
+            model: chosenModel.id,
+            mode: featureCategory,
+          })
+          .returning();
+        targetSessionId = createdSess.id;
+      }
+
+      if (regenerateLast && targetSessionId) {
+        const existingMsgs = await db
+          .select()
+          .from(chatMessages)
+          .where(eq(chatMessages.sessionId, targetSessionId))
+          .orderBy(asc(chatMessages.id));
+
+        let remainingMsgs = existingMsgs;
+        const lastMsg = existingMsgs[existingMsgs.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant') {
+          await db
+            .delete(chatMessages)
+            .where(eq(chatMessages.id, lastMsg.id));
+          remainingMsgs = existingMsgs.slice(0, -1);
+          const prevUser = existingMsgs[existingMsgs.length - 2];
+          if (prevUser && !effectivePrompt) {
+            effectivePrompt = prevUser.content;
+          }
+        }
+        historyForModel = remainingMsgs.slice(0, -1).map((m) => ({
+          role: (m.role as 'user' | 'assistant') || 'user',
+          content: m.content,
+        }));
+      } else {
+        let dbPriorMsgs: Array<{ role: string; content: string }> = [];
+        const hasClientHistory =
+          Array.isArray(clientHistory) && clientHistory.length > 0;
+
+        if (!isBrandNewSession && !hasClientHistory) {
+          dbPriorMsgs = await db
+            .select({
+              role: chatMessages.role,
+              content: chatMessages.content,
+            })
             .from(chatMessages)
             .where(eq(chatMessages.sessionId, targetSessionId))
             .orderBy(asc(chatMessages.id));
+        }
 
-          let remainingMsgs = existingMsgs;
-          const lastMsg = existingMsgs[existingMsgs.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant') {
-            await db
-              .delete(chatMessages)
-              .where(eq(chatMessages.id, lastMsg.id));
-            remainingMsgs = existingMsgs.slice(0, -1);
-            const prevUser = existingMsgs[existingMsgs.length - 2];
-            if (prevUser && !effectivePrompt) {
-              effectivePrompt = prevUser.content;
-            }
-          }
-          historyForModel = remainingMsgs.slice(0, -1).map((m) => ({
-            role: (m.role as 'user' | 'assistant') || 'user',
-            content: m.content,
-          }));
-        } else {
-          const insertUserMsgPromise = db.insert(chatMessages).values({
+        const [insertedUserMsg] = await db
+          .insert(chatMessages)
+          .values({
             sessionId: targetSessionId,
             userId: authUser.id,
             role: 'user',
@@ -1627,196 +1314,201 @@ async function startServer() {
                   }))
                 )
               : null,
-          });
+          })
+          .returning({ id: chatMessages.id });
+        insertedUserMsgId = insertedUserMsg?.id ?? null;
 
-          if (isBrandNewSession) {
-            await insertUserMsgPromise;
-            historyForModel = [];
-          } else if (Array.isArray(clientHistory)) {
-            await insertUserMsgPromise;
-            historyForModel = clientHistory
-              .filter(
-                (m) =>
-                  (m.role === 'user' || m.role === 'assistant') &&
-                  typeof m.content === 'string' &&
-                  m.content.trim().length > 0
-              )
-              .slice(-12)
-              .map((m) => ({
-                role: m.role as 'user' | 'assistant',
-                content: String(m.content),
-              }));
-          } else {
-            const [, priorMsgs] = await Promise.all([
-              insertUserMsgPromise,
-              db
-                .select()
-                .from(chatMessages)
-                .where(eq(chatMessages.sessionId, targetSessionId))
-                .orderBy(asc(chatMessages.id)),
-            ]);
-            historyForModel = priorMsgs
-              .filter((m) => m.role === 'user' || m.role === 'assistant')
-              .slice(-12)
-              .map((m) => ({
-                role: (m.role as 'user' | 'assistant') || 'user',
-                content: m.content,
-              }));
-          }
+        if (hasClientHistory) {
+          historyForModel = clientHistory!
+            .filter(
+              (m) =>
+                (m.role === 'user' || m.role === 'assistant') &&
+                typeof m.content === 'string' &&
+                m.content.trim().length > 0
+            )
+            .slice(-16)
+            .map((m) => ({
+              role: m.role as 'user' | 'assistant',
+              content: String(m.content),
+            }));
+        } else if (dbPriorMsgs.length > 0) {
+          historyForModel = dbPriorMsgs
+            .filter((m) => m.role === 'user' || m.role === 'assistant')
+            .slice(-16)
+            .map((m) => ({
+              role: (m.role as 'user' | 'assistant') || 'user',
+              content: m.content,
+            }));
         }
+      }
 
-        // Start SSE Stream immediately
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.flushHeaders?.();
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
 
-        const sendSSE = (obj: Record<string, unknown>) => {
-          if (!res.writableEnded) {
-            res.write(`data: ${JSON.stringify(obj)}\n\n`);
-          }
-        };
+      const sendSSE = (obj: Record<string, unknown>) => {
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        }
+      };
 
-        const authHeartbeatTimer = setInterval(() => {
-          if (!res.writableEnded) {
-            res.write(`: heartbeat\n\n`);
-          }
-        }, 5000);
-        res.on('close', () => clearInterval(authHeartbeatTimer));
+      const chatHeartbeatTimer = setInterval(() => {
+        if (!res.writableEnded) {
+          res.write(`: heartbeat\n\n`);
+        }
+      }, 5000);
+      res.on('close', () => clearInterval(chatHeartbeatTimer));
 
-        sendSSE({
-          type: 'meta',
-          sessionId: targetSessionId,
-          model: chosenModel.id,
+      sendSSE({
+        type: 'meta',
+        sessionId: targetSessionId,
+        model: chosenModel.id,
+        provider: chosenModel.provider,
+      });
+
+      try {
+        const result = await streamChatCompletion({
+          modelConfig: chosenModel,
+          history: historyForModel,
+          prompt: effectivePrompt,
+          webSearch: Boolean(webSearch),
+          reasoningEffort:
+            reasoningEffort &&
+            ['low', 'medium', 'high'].includes(reasoningEffort)
+              ? reasoningEffort
+              : 'low',
+          attachments: attachments?.map((a) => ({
+            name: a.name,
+            mimeType: a.mimeType,
+            base64Data: a.base64Data,
+          })),
+          userFullName: authUser.fullName,
+          onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
         });
 
-        try {
-          const result = await streamChatCompletion({
-            modelConfig: chosenModel,
-            history: historyForModel,
-            prompt: effectivePrompt,
-            webSearch: Boolean(webSearch),
-            reasoningEffort:
-              reasoningEffort &&
-              ['low', 'medium', 'high'].includes(reasoningEffort)
-                ? reasoningEffort
-                : 'low',
-            attachments: attachments?.map((a) => ({
-              name: a.name,
-              mimeType: a.mimeType,
-              base64Data: a.base64Data,
-            })),
-            userFullName: authUser.fullName,
-            onDelta: (delta) => sendSSE({ type: 'delta', text: delta }),
-          });
+        const actualCredits = calculateInternalCreditCharge(
+          baseReserve,
+          per1kTokenRate,
+          result.totalTokens
+        );
 
-          const actualCredits = calculateInternalCreditCharge(
-            baseReserve,
-            per1kTokenRate,
-            result.totalTokens
-          );
+        trackLiveUsdSpend(result.providerCostUsd);
 
-          trackLiveUsdSpend(result.providerCostUsd);
-
-          const [, , [savedAssistant]] = await Promise.all([
-            finalizeCreditReservation({
-              userId: authUser.id,
-              reservationId: reservation.reservationId,
-              reservedAmount: reserveAmount,
-              actualAmount: actualCredits,
-              feature: featureCategory,
-              description: `${result.modelUsed} · ${result.totalTokens} tokens`,
-            }),
-            db.insert(providerUsageLogs).values({
-              userId: authUser.id,
-              provider: result.providerUsed,
-              model: result.modelUsed,
-              feature: featureCategory,
-              promptTokens: result.promptTokens,
-              completionTokens: result.completionTokens,
-              totalTokens: result.totalTokens,
-              providerCostUsd: result.providerCostUsd.toFixed(6),
-              internalCreditsCharged: actualCredits,
-            }),
-            db
-              .insert(chatMessages)
-              .values({
-                sessionId: targetSessionId,
-                userId: authUser.id,
-                role: 'assistant',
-                content: result.fullText || 'Completed.',
-                model: chosenModel.id,
-                mode: featureCategory,
-                citationsJson:
-                  result.citations.length > 0
-                    ? JSON.stringify(result.citations)
-                    : null,
-                creditsCharged: actualCredits,
-                tokensUsed: result.totalTokens,
-                providerCostUsd: result.providerCostUsd.toFixed(6),
-              })
-              .returning(),
-            db
-              .update(chatSessions)
-              .set({ updatedAt: new Date() })
-              .where(eq(chatSessions.id, targetSessionId)),
-          ]);
-
-          sendSSE({
-            type: 'done',
-            sessionId: targetSessionId,
-            messageId: savedAssistant.id,
-            creditsCharged: actualCredits,
-            tokensUsed: result.totalTokens,
-            providerUsed: result.providerUsed,
-            modelUsed: result.modelUsed,
-            citations: result.citations,
-          });
-          clearInterval(authHeartbeatTimer);
-          res.end();
-        } catch (streamErr: unknown) {
-          clearInterval(authHeartbeatTimer);
-          // Full Atomic Refund on AI Provider Failure!
-          await finalizeCreditReservation({
+        const [, , [savedAssistant]] = await Promise.all([
+          finalizeCreditReservation({
             userId: authUser.id,
             reservationId: reservation.reservationId,
             reservedAmount: reserveAmount,
-            actualAmount: 0,
+            actualAmount: actualCredits,
             feature: featureCategory,
-            description: 'Provider failure refund',
-          });
-          const errMeta = extractProviderErrorMeta(streamErr);
-          await recordProviderApiError({
-            actorUserId: authUser.id,
-            actorEmail: authUser.email,
-            provider:
-              chosenModel.provider === 'gemini' ||
-              chosenModel.provider === 'bridge'
-                ? 'gemini'
-                : 'openai',
-            model: chosenModel.id,
+            description: `${result.modelUsed} · ${result.totalTokens} tokens`,
+          }),
+          db.insert(providerUsageLogs).values({
+            userId: authUser.id,
+            provider: result.providerUsed,
+            model: result.modelUsed,
             feature: featureCategory,
-            status: errMeta.status,
-            errorCode: errMeta.errorCode,
-            safeMessage: errMeta.safeMessage,
-          });
-          sendSSE({
-            type: 'error',
-            error:
-              streamErr instanceof Error
-                ? streamErr.message
-                : 'AI generation failed. Reserved credits have been refunded.',
-          });
-          res.end();
-        }
-      } catch (outerErr: unknown) {
-        sendCommandError(res, outerErr, 'Unable to start chat request.');
-      }
-    }
-  );
+            promptTokens: result.promptTokens,
+            completionTokens: result.completionTokens,
+            totalTokens: result.totalTokens,
+            providerCostUsd: result.providerCostUsd.toFixed(6),
+            internalCreditsCharged: actualCredits,
+          }),
+          db
+            .insert(chatMessages)
+            .values({
+              sessionId: targetSessionId,
+              userId: authUser.id,
+              role: 'assistant',
+              content: result.fullText || 'Completed.',
+              model: result.modelUsed,
+              mode: featureCategory,
+              citationsJson:
+                result.citations.length > 0
+                  ? JSON.stringify(result.citations)
+                  : null,
+              creditsCharged: actualCredits,
+              tokensUsed: result.totalTokens,
+              providerCostUsd: result.providerCostUsd.toFixed(6),
+            })
+            .returning(),
+          db
+            .update(chatSessions)
+            .set({ updatedAt: new Date() })
+            .where(eq(chatSessions.id, targetSessionId)),
+        ]);
 
-  // 10. Image Generation Endpoint (Atomic Reservation & Refund)
+        sendSSE({
+          type: 'done',
+          sessionId: targetSessionId,
+          messageId: savedAssistant.id,
+          creditsCharged: actualCredits,
+          tokensUsed: result.totalTokens,
+          providerUsed: result.providerUsed,
+          modelUsed: result.modelUsed,
+          citations: result.citations,
+        });
+        clearInterval(chatHeartbeatTimer);
+        res.end();
+      } catch (streamErr: unknown) {
+        clearInterval(chatHeartbeatTimer);
+        await finalizeCreditReservation({
+          userId: authUser.id,
+          reservationId: reservation.reservationId,
+          reservedAmount: reserveAmount,
+          actualAmount: 0,
+          feature: featureCategory,
+          description: 'AI provider API failure refund',
+        });
+        if (insertedUserMsgId) {
+          await db
+            .delete(chatMessages)
+            .where(eq(chatMessages.id, insertedUserMsgId))
+            .catch(() => undefined);
+        }
+        if (isBrandNewSession && targetSessionId) {
+          await db
+            .delete(chatSessions)
+            .where(eq(chatSessions.id, targetSessionId))
+            .catch(() => undefined);
+        }
+        const errMeta = extractProviderErrorMeta(streamErr);
+        await recordProviderApiError({
+          actorUserId: authUser.id,
+          actorEmail: authUser.email,
+          provider: chosenModel.provider,
+          model: chosenModel.id,
+          feature: featureCategory,
+          status: errMeta.status,
+          errorCode: errMeta.errorCode,
+          safeMessage: errMeta.safeMessage,
+        });
+        sendSSE({
+          type: 'error',
+          code: errMeta.errorCode || 'PROVIDER_API_ERROR',
+          error: redactSecrets(
+            streamErr instanceof Error
+              ? streamErr.message
+              : 'AI chat streaming request failed.'
+          ),
+        });
+        res.end();
+      }
+    } catch (outerError: unknown) {
+      sendCommandError(
+        res,
+        outerError,
+        'Unable to start AI chat response.'
+      );
+    }
+  };
+
+  app.post('/api/chat', requireAuth, perUserChatLimiter, handleAuthenticatedOpenAIChat);
+  app.post('/api/chat/stream', requireAuth, perUserChatLimiter, handleAuthenticatedOpenAIChat);
+
+  // 10. Image Generation Endpoint (Google Gemini + OpenAI Atomic Reservation & Refund)
   app.post(
     '/api/image/generate',
     requireAuth,
@@ -1832,6 +1524,15 @@ async function startServer() {
           return;
         }
 
+        if (!isGoogleConfigured() && !isOpenAIConfigured()) {
+          res.status(503).json({
+            code: 'AI_SECRET_MISSING',
+            error:
+              'Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets to generate images.',
+          });
+          return;
+        }
+
         await enforcePlatformSpendCaps(config);
 
         const prompt = String(req.body?.prompt || '').trim();
@@ -1840,6 +1541,10 @@ async function startServer() {
         )
           ? req.body.aspectRatio
           : '1:1';
+        const preferredProvider =
+          req.body?.provider === 'google' || req.body?.provider === 'openai'
+            ? req.body.provider
+            : undefined;
 
         if (!prompt) {
           res.status(400).json({ error: 'Please enter an image prompt.' });
@@ -1855,7 +1560,11 @@ async function startServer() {
         });
 
         try {
-          const generated = await generateImageAsset(prompt, aspectRatio);
+          const generated = await generateImageAsset(
+            prompt,
+            aspectRatio,
+            preferredProvider
+          );
 
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -1878,7 +1587,6 @@ async function startServer() {
             internalCreditsCharged: costCredits,
           });
 
-          // Persist inside a dedicated Image Studio chat session so user always has history
           const [imgSession] = await db
             .insert(chatSessions)
             .values({
@@ -1917,11 +1625,15 @@ async function startServer() {
             description: 'Failed image generation refund',
           });
           const errMeta = extractProviderErrorMeta(genErr);
+          const errProvider = isOpenAIConfigured() ? 'openai' : 'google';
           await recordProviderApiError({
             actorUserId: authUser.id,
             actorEmail: authUser.email,
-            provider: 'openai',
-            model: 'dall-e-3',
+            provider: errProvider,
+            model:
+              errProvider === 'google'
+                ? 'gemini-3.1-flash-lite-image'
+                : 'dall-e-3',
             feature: 'image',
             status: errMeta.status,
             errorCode: errMeta.errorCode,
@@ -1935,7 +1647,7 @@ async function startServer() {
     }
   );
 
-  // 11. Speech-to-Text Endpoint
+  // 11. Speech-to-Text Endpoint (Google Gemini Transcribe + OpenAI Audio)
   app.post(
     '/api/voice/transcribe',
     requireAuth,
@@ -1950,6 +1662,14 @@ async function startServer() {
           });
           return;
         }
+        if (!isGoogleConfigured() && !isOpenAIConfigured()) {
+          res.status(503).json({
+            code: 'AI_SECRET_MISSING',
+            error:
+              'Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets to use Speech-to-Text.',
+          });
+          return;
+        }
         await enforcePlatformSpendCaps(config);
 
         const { base64Audio, mimeType, provider } = req.body || {};
@@ -1957,9 +1677,6 @@ async function startServer() {
           res.status(400).json({ error: 'Audio payload missing.' });
           return;
         }
-
-        const preferredProvider: 'openai' | 'gemini' | undefined =
-          provider === 'openai' || provider === 'gemini' ? provider : undefined;
 
         const sttCredits = config.creditRates.voiceStt;
         const reservation = await reserveCreditsForUsage({
@@ -1973,7 +1690,7 @@ async function startServer() {
           const out = await transcribeAudioBuffer(
             base64Audio,
             mimeType || 'audio/webm',
-            preferredProvider
+            provider === 'google' || provider === 'openai' ? provider : undefined
           );
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -1981,7 +1698,7 @@ async function startServer() {
             reservedAmount: sttCredits,
             actualAmount: sttCredits,
             feature: 'voice',
-            description: 'Speech-to-Text Dictation',
+            description: `Speech-to-Text (${out.modelUsed})`,
           });
 
           await db.insert(providerUsageLogs).values({
@@ -2008,14 +1725,15 @@ async function startServer() {
             description: 'Failed STT refund',
           });
           const errMeta = extractProviderErrorMeta(err);
+          const errProvider = isGoogleConfigured() ? 'google' : 'openai';
           await recordProviderApiError({
             actorUserId: authUser.id,
             actorEmail: authUser.email,
-            provider: preferredProvider || 'gemini',
+            provider: errProvider,
             model:
-              preferredProvider === 'openai'
-                ? 'gpt-4o-mini-transcribe'
-                : 'gemini-3.5-transcribe',
+              errProvider === 'google'
+                ? 'gemini-3.5-transcribe'
+                : 'gpt-4o-mini-transcribe',
             feature: 'voice_stt',
             status: errMeta.status,
             errorCode: errMeta.errorCode,
@@ -2029,7 +1747,7 @@ async function startServer() {
     }
   );
 
-  // 12. Text-to-Speech Endpoint
+  // 12. Text-to-Speech Endpoint (Google Gemini Flash Lite TTS + OpenAI Neural TTS)
   app.post(
     '/api/voice/speak',
     requireAuth,
@@ -2044,6 +1762,14 @@ async function startServer() {
           });
           return;
         }
+        if (!isGoogleConfigured() && !isOpenAIConfigured()) {
+          res.status(503).json({
+            code: 'AI_SECRET_MISSING',
+            error:
+              'Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets to use Text-to-Speech.',
+          });
+          return;
+        }
         await enforcePlatformSpendCaps(config);
 
         const { text, voice, provider } = req.body || {};
@@ -2051,9 +1777,6 @@ async function startServer() {
           res.status(400).json({ error: 'Text required for TTS.' });
           return;
         }
-
-        const preferredProvider: 'openai' | 'gemini' | undefined =
-          provider === 'openai' || provider === 'gemini' ? provider : undefined;
 
         const ttsCredits = config.creditRates.voiceTts;
         const reservation = await reserveCreditsForUsage({
@@ -2067,7 +1790,7 @@ async function startServer() {
           const out = await synthesizeSpeechAudio(
             String(text),
             voice || authUser.preferredVoice || 'alloy',
-            preferredProvider
+            provider === 'google' || provider === 'openai' ? provider : undefined
           );
           await finalizeCreditReservation({
             userId: authUser.id,
@@ -2075,7 +1798,7 @@ async function startServer() {
             reservedAmount: ttsCredits,
             actualAmount: ttsCredits,
             feature: 'voice',
-            description: 'Neural Text-to-Speech',
+            description: `Neural Text-to-Speech (${out.modelUsed})`,
           });
 
           await db.insert(providerUsageLogs).values({
@@ -2102,14 +1825,13 @@ async function startServer() {
             description: 'Failed TTS refund',
           });
           const errMeta = extractProviderErrorMeta(err);
+          const errProvider = isGoogleConfigured() ? 'google' : 'openai';
           await recordProviderApiError({
             actorUserId: authUser.id,
             actorEmail: authUser.email,
-            provider: preferredProvider || 'gemini',
+            provider: errProvider,
             model:
-              preferredProvider === 'openai'
-                ? 'tts-1'
-                : 'gemini-3.8-flash-lite-tts',
+              errProvider === 'google' ? 'gemini-3.8-flash-lite-tts' : 'tts-1',
             feature: 'voice_tts',
             status: errMeta.status,
             errorCode: errMeta.errorCode,
@@ -2455,7 +2177,7 @@ async function startServer() {
     }
   );
 
-  // Save Platform Settings (Receiver numbers, credit rates, OpenAI/Gemini USD caps, models, tools)
+  // Save Platform Settings (Receiver numbers, credit rates, OpenAI USD caps, models, tools)
   app.put(
     '/api/admin/config',
     requireAuth,
@@ -2483,6 +2205,27 @@ async function startServer() {
     }
   );
 
+  // Live Google Gemini API Connection Diagnostic (Protected Admin Route — Never Exposes GEMINI_API_KEY)
+  app.post(
+    '/api/admin/google/test',
+    requireAuth,
+    requireAdmin,
+    async (_req: AuthRequest, res) => {
+      try {
+        const diagnostic = await testGoogleConnection();
+        res.json(diagnostic);
+      } catch (error: unknown) {
+        res.status(500).json({
+          ok: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Google Gemini connection diagnostic failed.',
+        });
+      }
+    }
+  );
+
   // Live OpenAI API Connection Diagnostic (Protected Admin Route — Never Exposes OPENAI_API_KEY)
   app.post(
     '/api/admin/openai/test',
@@ -2504,7 +2247,7 @@ async function startServer() {
     }
   );
 
-  // Live Multi-Provider (OpenAI + Google Gemini) Connectivity & Model Discovery Diagnostic
+  // Live Google Gemini + OpenAI Connectivity & Model Discovery Diagnostic
   app.post(
     '/api/admin/providers/test',
     requireAuth,
@@ -2529,6 +2272,7 @@ async function startServer() {
     let viteInstance: Awaited<
       ReturnType<typeof import('vite')['createServer']>
     > | null = null;
+    let viteInitError: unknown = null;
     const viteReady = import('vite')
       .then(({ createServer: createViteServer }) =>
         createViteServer({
@@ -2539,11 +2283,20 @@ async function startServer() {
       .then((v) => {
         viteInstance = v;
         return v;
+      })
+      .catch((err) => {
+        viteInitError = err;
+        console.error('Vite middleware initialization error:', err);
+        return null;
       });
 
     app.use(async (req, res, next) => {
       try {
         const vite = viteInstance || (await viteReady);
+        if (!vite) {
+          next(viteInitError || new Error('Vite server failed to initialize'));
+          return;
+        }
         vite.middlewares(req, res, next);
       } catch (err) {
         next(err);
@@ -2613,10 +2366,6 @@ async function startServer() {
       };
 
       const token = parsedUrl.searchParams.get('token') || '';
-      const requestedProvider =
-        parsedUrl.searchParams.get('provider') === 'openai'
-          ? 'openai'
-          : 'gemini';
 
       const wsUser = await resolveWsUser(token);
       if (!wsUser) {
@@ -2624,6 +2373,17 @@ async function startServer() {
           type: 'error',
           code: 'LOGIN_REQUIRED',
           message: 'Unauthorized session. Please sign in again.',
+        });
+        clientWs.close();
+        return;
+      }
+
+      if (!isGoogleConfigured() && !isOpenAIConfigured()) {
+        sendClient({
+          type: 'error',
+          code: 'AI_SECRET_MISSING',
+          message:
+            'Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets to use Realtime Voice.',
         });
         clientWs.close();
         return;
@@ -2653,6 +2413,17 @@ async function startServer() {
         return;
       }
 
+      const reqProvider = parsedUrl.searchParams.get('provider');
+      const useGoogleLive =
+        reqProvider === 'google' ||
+        (reqProvider !== 'openai' && isGoogleConfigured());
+      const activeVoiceProvider: 'google' | 'openai' = useGoogleLive
+        ? 'google'
+        : 'openai';
+      const activeVoiceModel = useGoogleLive
+        ? 'gemini-3.8-live'
+        : 'gpt-4o-mini-realtime-preview';
+
       const reserveCredits = rawConfig.creditRates.voiceRealtime || 6;
       let reservationId = '';
       try {
@@ -2660,7 +2431,7 @@ async function startServer() {
           userId: wsUser.id,
           feature: 'voice',
           reserveAmount: reserveCredits,
-          description: `Realtime Voice (${requestedProvider.toUpperCase()})`,
+          description: `Realtime Voice (${activeVoiceProvider.toUpperCase()})`,
         });
         reservationId = resv.reservationId;
       } catch (resvErr: unknown) {
@@ -2681,10 +2452,10 @@ async function startServer() {
 
       let settled = false;
       let audioFramesReceived = 0;
-      let geminiLiveSession: Awaited<
-        ReturnType<typeof connectGeminiLiveVoiceSession>
-      > | null = null;
       let openaiUpstreamWs: WebSocket | null = null;
+      let googleLiveSession: Awaited<
+        ReturnType<ReturnType<typeof getGoogleGenAIClient>['live']['connect']>
+      > | null = null;
 
       const settleSession = async (failed: boolean, failReason?: string) => {
         if (settled) return;
@@ -2699,23 +2470,20 @@ async function startServer() {
             feature: 'voice',
             description: failed
               ? failReason || 'Realtime voice failure refund'
-              : 'Realtime voice session completed',
+              : `Realtime voice (${activeVoiceProvider}) completed`,
           });
 
           if (shouldCharge) {
             await db.insert(providerUsageLogs).values({
               userId: wsUser.id,
-              provider: requestedProvider,
-              model:
-                requestedProvider === 'openai'
-                  ? 'gpt-4o-mini-realtime-preview'
-                  : 'gemini-3.8-live',
+              provider: activeVoiceProvider,
+              model: activeVoiceModel,
               feature: 'voice',
               promptTokens: 350,
               completionTokens: 350,
               totalTokens: 700,
               providerCostUsd:
-                requestedProvider === 'openai' ? '0.014000' : '0.002200',
+                activeVoiceProvider === 'google' ? '0.008000' : '0.014000',
               internalCreditsCharged: reserveCredits,
             });
           }
@@ -2724,54 +2492,82 @@ async function startServer() {
         }
       };
 
-      if (requestedProvider === 'gemini') {
+      if (useGoogleLive) {
         try {
-          geminiLiveSession = await connectGeminiLiveVoiceSession({
-            userFullName: wsUser.fullName,
-            voiceName: wsUser.preferredVoice,
-            onAudioBase64: (pcm24kBase64) => {
-              audioFramesReceived++;
-              sendClient({
-                type: 'audio',
-                sampleRate: 24000,
-                base64: pcm24kBase64,
-              });
-            },
-            onTranscript: (role, text) => {
-              sendClient({ type: 'transcript', role, text });
-            },
-            onInterrupted: () => {
-              sendClient({ type: 'interrupted' });
-            },
-            onError: async (safeError) => {
-              await recordProviderApiError({
-                actorUserId: wsUser.id,
-                actorEmail: wsUser.email,
-                provider: 'gemini',
-                model: 'gemini-3.8-live',
-                feature: 'voice_realtime',
-                status: 500,
-                errorCode: 'gemini_live_error',
-                safeMessage: safeError,
-              });
-              sendClient({ type: 'error', message: safeError });
-              await settleSession(true, safeError);
-              clientWs.close();
-            },
-          });
-
-          sendClient({
-            type: 'ready',
-            provider: 'gemini',
+          const ai = getGoogleGenAIClient();
+          googleLiveSession = await ai.live.connect({
             model: 'gemini-3.8-live',
-            creditsReserved: reserveCredits,
+            config: {
+              responseModalities: [Modality.AUDIO],
+              systemInstruction: `You are QAAGA AGENT Live Voice Assistant speaking with ${wsUser.fullName}. Fluently understand and speak English and Bengali. Keep spoken replies concise, warm, and natural.`,
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: 'Zephyr' },
+                },
+              },
+            },
+            callbacks: {
+              onopen: () => {
+                sendClient({
+                  type: 'ready',
+                  provider: 'google',
+                  model: 'gemini-3.8-live',
+                  creditsReserved: reserveCredits,
+                });
+              },
+              onmessage: (message) => {
+                const serverContent = message.serverContent;
+                if (serverContent?.interrupted) {
+                  sendClient({ type: 'interrupted' });
+                }
+                const parts = serverContent?.modelTurn?.parts || [];
+                for (const p of parts) {
+                  if (p.inlineData?.data) {
+                    audioFramesReceived++;
+                    sendClient({
+                      type: 'audio',
+                      sampleRate: 24000,
+                      base64: p.inlineData.data,
+                    });
+                  }
+                  if (p.text) {
+                    sendClient({
+                      type: 'transcript',
+                      role: 'assistant',
+                      text: p.text,
+                    });
+                  }
+                }
+              },
+              onerror: async (errEvt) => {
+                const meta = extractProviderErrorMeta(errEvt);
+                await recordProviderApiError({
+                  actorUserId: wsUser.id,
+                  actorEmail: wsUser.email,
+                  provider: 'google',
+                  model: 'gemini-3.8-live',
+                  feature: 'voice_realtime',
+                  status: meta.status,
+                  errorCode: meta.errorCode,
+                  safeMessage: meta.safeMessage,
+                });
+                sendClient({ type: 'error', message: meta.safeMessage });
+                await settleSession(true, meta.safeMessage);
+                clientWs.close();
+              },
+              onclose: () => {
+                if (clientWs.readyState === WebSocket.OPEN) {
+                  clientWs.close();
+                }
+              },
+            },
           });
-        } catch (connErr: unknown) {
-          const meta = extractProviderErrorMeta(connErr);
+        } catch (initErr: unknown) {
+          const meta = extractProviderErrorMeta(initErr);
           await recordProviderApiError({
             actorUserId: wsUser.id,
             actorEmail: wsUser.email,
-            provider: 'gemini',
+            provider: 'google',
             model: 'gemini-3.8-live',
             feature: 'voice_realtime',
             status: meta.status,
@@ -2779,12 +2575,12 @@ async function startServer() {
             safeMessage: meta.safeMessage,
           });
           sendClient({ type: 'error', message: meta.safeMessage });
-          await settleSession(true, 'Gemini Live connect failed');
+          await settleSession(true, meta.safeMessage);
           clientWs.close();
           return;
         }
       } else {
-        // Official OpenAI Realtime WebSocket Bridge (strictly OpenAI — never falls back to Gemini)
+        // Official OpenAI Realtime WebSocket Bridge
         try {
           const headers = getOpenAIRealtimeAuthHeaders();
           openaiUpstreamWs = new WebSocket(
@@ -2921,8 +2717,8 @@ async function startServer() {
             text?: string;
           };
           if (msg.type === 'audio' && msg.base64) {
-            if (geminiLiveSession) {
-              geminiLiveSession.sendRealtimeInput({
+            if (googleLiveSession) {
+              googleLiveSession.sendRealtimeInput({
                 media: {
                   data: msg.base64,
                   mimeType: 'audio/pcm;rate=16000',
@@ -2940,14 +2736,9 @@ async function startServer() {
               );
             }
           } else if (msg.type === 'text' && msg.text) {
-            if (geminiLiveSession) {
-              geminiLiveSession.sendClientContent({
-                turns: [
-                  {
-                    role: 'user',
-                    parts: [{ text: msg.text }],
-                  },
-                ],
+            if (googleLiveSession) {
+              googleLiveSession.sendClientContent({
+                turns: [{ role: 'user', parts: [{ text: msg.text }] }],
                 turnComplete: true,
               });
             } else if (
@@ -2974,7 +2765,7 @@ async function startServer() {
 
       clientWs.on('close', async () => {
         try {
-          geminiLiveSession?.close();
+          googleLiveSession?.close();
         } catch {
           // ignore
         }

@@ -61,6 +61,49 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
     walletVerificationMode: 'admin-reconciled-estimate',
   },
   models: [
+    // 0. Google Gemini Models (@google/genai Official Server-Side SDK)
+    {
+      id: 'gemini-3.1-flash-lite',
+      label: 'Google Gemini 3.1 Flash Lite (Fast)',
+      provider: 'google',
+      tier: 'google-economical',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.075,
+      outputUsdPer1M: 0.3,
+      baseCreditCost: 1,
+      creditsPer1kTokens: 1,
+      description:
+        'Ultra-fast Google Gemini multimodal model for chat, vision, PDFs & live Google Search',
+    },
+    {
+      id: 'gemini-3.8-flash',
+      label: 'Google Gemini 3.8 Flash (Standard)',
+      provider: 'google',
+      tier: 'google-standard',
+      category: 'chat',
+      enabled: true,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 2,
+      creditsPer1kTokens: 1,
+      description:
+        'High-intelligence Google Gemini 3.8 model for coding, reasoning, documents & grounded search',
+    },
+    {
+      id: 'gemini-4-argon',
+      label: 'Google Gemini 4 Argon (Reasoning)',
+      provider: 'google',
+      tier: 'google-reasoning',
+      category: 'reasoning',
+      enabled: true,
+      inputUsdPer1M: 1.25,
+      outputUsdPer1M: 5.0,
+      baseCreditCost: 5,
+      creditsPer1kTokens: 3,
+      description:
+        'Frontier Google Gemini 4 deep reasoning model for STEM, algorithms & complex synthesis',
+    },
     // 1. OpenAI Advanced Reasoning Models
     {
       id: 'o3-mini',
@@ -154,33 +197,6 @@ export const DEFAULT_PLATFORM_CONFIG: PlatformConfigDTO = {
       baseCreditCost: 2,
       creditsPer1kTokens: 1,
       description: 'Balanced speed, coding intelligence & economical token pricing',
-    },
-    // 4. Google Gemini Models (Fast Flash Lite ordered first for sub-second response)
-    {
-      id: 'gemini-3.1-flash-lite',
-      label: 'Google Gemini 3.1 Flash Lite',
-      provider: 'gemini',
-      tier: 'gemini',
-      category: 'chat',
-      enabled: true,
-      inputUsdPer1M: 0.075,
-      outputUsdPer1M: 0.3,
-      baseCreditCost: 1,
-      creditsPer1kTokens: 1,
-      description: 'Ultra-fast, low-cost everyday chat, PDF, vision & search',
-    },
-    {
-      id: 'gemini-3.8-flash',
-      label: 'Google Gemini 3.8 Flash',
-      provider: 'gemini',
-      tier: 'gemini',
-      category: 'chat',
-      enabled: true,
-      inputUsdPer1M: 0.15,
-      outputUsdPer1M: 0.6,
-      baseCreditCost: 2,
-      creditsPer1kTokens: 1,
-      description: 'Deep multimodal reasoning, native PDF vision & Google Search grounding',
     },
   ],
 };
@@ -594,11 +610,24 @@ export function mapUserRowToDTO(row: typeof users.$inferSelect): AuthUser {
     isSubscriptionActive,
     daysRemaining,
     dailyCreditLimit: row.dailyCreditLimit,
-    preferredModel: row.preferredModel,
+    preferredModel:
+      !row.preferredModel ||
+      /^(gemini-1\.5|gemini-2\.0|gemini-pro)/i.test(row.preferredModel)
+        ? 'gemini-3.1-flash-lite'
+        : row.preferredModel,
     preferredVoice: row.preferredVoice,
     theme: row.theme === 'dark' ? 'dark' : 'light',
     createdAt: row.createdAt.toISOString(),
   };
+}
+
+function isDeprecatedGeminiModelId(id: string): boolean {
+  const lower = (id || '').trim().toLowerCase();
+  return (
+    lower === 'gemini-pro' ||
+    lower.startsWith('gemini-1.5') ||
+    lower.startsWith('gemini-2.0')
+  );
 }
 
 let cachedPlatformConfig: {
@@ -625,11 +654,17 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
     }
 
     const stored = JSON.parse(rows[0].valueJson) as Partial<PlatformConfigDTO>;
+    const storedValidModels = (stored.models || []).filter((m) => {
+      const p = m.provider as string;
+      if (p !== 'openai' && p !== 'google') return false;
+      if (isDeprecatedGeminiModelId(m.id)) return false;
+      return true;
+    });
     const storedById = new Map(
-      (stored.models || []).map((m) => [m.id, m] as const)
+      storedValidModels.map((m) => [m.id, m] as const)
     );
 
-    // Non-destructively merge default catalog models with any stored admin customizations
+    // Non-destructively merge default Google + OpenAI catalog models with any stored admin customizations
     const mergedModels = DEFAULT_PLATFORM_CONFIG.models.map((defModel) => {
       const existing = storedById.get(defModel.id);
       if (!existing) return defModel;
@@ -637,19 +672,19 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
       return {
         ...defModel,
         ...existing,
-        provider:
-          existing.provider === 'bridge'
-            ? ('gemini' as const)
-            : existing.provider || defModel.provider,
+        provider: defModel.provider,
         tier: existing.tier || defModel.tier,
       };
     });
 
-    // Preserve any custom models added previously
+    // Preserve any custom Google or OpenAI models added previously
     for (const extra of storedById.values()) {
+      const inferredProvider = extra.id.toLowerCase().startsWith('gemini')
+        ? ('google' as const)
+        : ('openai' as const);
       mergedModels.push({
         ...extra,
-        provider: extra.provider === 'bridge' ? 'gemini' : extra.provider,
+        provider: extra.provider === 'google' ? 'google' : inferredProvider,
       });
     }
 
@@ -700,7 +735,7 @@ export async function getPlatformConfig(): Promise<PlatformConfigDTO> {
 export async function recordProviderApiError(params: {
   actorUserId?: number | null;
   actorEmail: string;
-  provider: 'openai' | 'gemini';
+  provider: 'openai' | 'google';
   model: string;
   feature: string;
   status: number | null;
@@ -755,10 +790,21 @@ export async function savePlatformConfig(
   actor: { id: number; email: string }
 ): Promise<PlatformConfigDTO> {
   try {
-    const cleanModels = (nextConfig.models || []).map((m) => {
-      const { available: _av, availabilityNote: _note, ...persisted } = m;
-      return persisted;
-    });
+    const cleanModels = (nextConfig.models || [])
+      .filter((m) => {
+        const p = m.provider as string;
+        if (p !== 'openai' && p !== 'google') return false;
+        if (isDeprecatedGeminiModelId(m.id)) return false;
+        return true;
+      })
+      .map((m) => {
+        const { available: _av, availabilityNote: _note, ...persisted } = m;
+        const resolvedProvider =
+          m.provider === 'google' || m.id.toLowerCase().startsWith('gemini')
+            ? ('google' as const)
+            : ('openai' as const);
+        return { ...persisted, provider: resolvedProvider };
+      });
     const sanitizedBranding = {
       logoDataUrl: sanitizeBrandAssetUrl(
         nextConfig.branding?.logoDataUrl,
@@ -1301,8 +1347,8 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
 
     let openaiUsedUsd = 0;
     let openaiTodayUsd = 0;
-    let geminiUsedUsd = 0;
-    let geminiTodayUsd = 0;
+    let googleUsedUsd = 0;
+    let googleTodayUsd = 0;
     let totalTokensUsed = 0;
 
     const modelMap = new Map<
@@ -1323,7 +1369,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         credits: number;
         usdCost: number;
         openaiUsdCost: number;
-        geminiUsdCost: number;
+        googleUsdCost: number;
         tokens: number;
         requests: number;
       }
@@ -1337,7 +1383,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       {
         usdCost: number;
         openaiUsdCost: number;
-        geminiUsdCost: number;
+        googleUsdCost: number;
         requests: number;
         tokens: number;
         creditsCharged: number;
@@ -1355,23 +1401,28 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         credits: 0,
         usdCost: 0,
         openaiUsdCost: 0,
-        geminiUsdCost: 0,
+        googleUsdCost: 0,
         tokens: 0,
         requests: 0,
       });
     }
 
     for (const log of allProviderLogs) {
+      const prov =
+        log.provider === 'google' || log.model.toLowerCase().startsWith('gemini')
+          ? 'google'
+          : log.provider === 'openai'
+          ? 'openai'
+          : null;
+      if (!prov) {
+        continue;
+      }
       const usd = Number(log.providerCostUsd) || 0;
-      const isGemini =
-        log.provider === 'gemini' ||
-        log.provider === 'bridge' ||
-        log.model.startsWith('gemini');
       const isToday = new Date(log.createdAt) >= todayStart;
 
-      if (isGemini) {
-        geminiUsedUsd += usd;
-        if (isToday) geminiTodayUsd += usd;
+      if (prov === 'google') {
+        googleUsedUsd += usd;
+        if (isToday) googleTodayUsd += usd;
       } else {
         openaiUsedUsd += usd;
         if (isToday) openaiTodayUsd += usd;
@@ -1388,14 +1439,14 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         credits: 0,
         usdCost: 0,
         openaiUsdCost: 0,
-        geminiUsdCost: 0,
+        googleUsdCost: 0,
         tokens: 0,
         requests: 0,
       };
       dayEntry.usdCost = Number((dayEntry.usdCost + usd).toFixed(6));
-      if (isGemini) {
-        dayEntry.geminiUsdCost = Number(
-          (dayEntry.geminiUsdCost + usd).toFixed(6)
+      if (prov === 'google') {
+        dayEntry.googleUsdCost = Number(
+          (dayEntry.googleUsdCost + usd).toFixed(6)
         );
       } else {
         dayEntry.openaiUsdCost = Number(
@@ -1407,11 +1458,10 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       dayEntry.requests += 1;
       dailyMap.set(dayLabel, dayEntry);
 
-      const normalizedProvider = isGemini ? 'gemini' : 'openai';
-      const mKey = `${normalizedProvider}:${log.model}`;
+      const mKey = `${prov}:${log.model}`;
       const mEntry = modelMap.get(mKey) || {
         model: log.model,
-        provider: normalizedProvider,
+        provider: prov,
         totalTokens: 0,
         usdCost: 0,
         creditsCharged: 0,
@@ -1437,14 +1487,14 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
       const uAgg = userProviderAgg.get(log.userId) || {
         usdCost: 0,
         openaiUsdCost: 0,
-        geminiUsdCost: 0,
+        googleUsdCost: 0,
         requests: 0,
         tokens: 0,
         creditsCharged: 0,
       };
       uAgg.usdCost = Number((uAgg.usdCost + usd).toFixed(6));
-      if (isGemini) {
-        uAgg.geminiUsdCost = Number((uAgg.geminiUsdCost + usd).toFixed(6));
+      if (prov === 'google') {
+        uAgg.googleUsdCost = Number((uAgg.googleUsdCost + usd).toFixed(6));
       } else {
         uAgg.openaiUsdCost = Number((uAgg.openaiUsdCost + usd).toFixed(6));
       }
@@ -1519,15 +1569,15 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
     }
 
     const purchasedUsd = config.openaiWallet.purchasedUsd;
-    const remainingEstimatedUsd = Math.max(
-      0,
-      Number((purchasedUsd - openaiUsedUsd).toFixed(4))
-    );
     const totalProviderUsedUsd = Number(
-      (openaiUsedUsd + geminiUsedUsd).toFixed(6)
+      (openaiUsedUsd + googleUsedUsd).toFixed(6)
     );
     const todayProviderUsedUsd = Number(
-      (openaiTodayUsd + geminiTodayUsd).toFixed(6)
+      (openaiTodayUsd + googleTodayUsd).toFixed(6)
+    );
+    const remainingEstimatedUsd = Math.max(
+      0,
+      Number((purchasedUsd - totalProviderUsedUsd).toFixed(4))
     );
 
     const paymentsDTO: PaymentRequestDTO[] = allPayments.map((p) => {
@@ -1562,7 +1612,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
           email: u.email,
           usdCost: pAgg?.usdCost || 0,
           openaiUsdCost: pAgg?.openaiUsdCost || 0,
-          geminiUsdCost: pAgg?.geminiUsdCost || 0,
+          googleUsdCost: pAgg?.googleUsdCost || 0,
           requests: pAgg?.requests || 0,
           tokens: pAgg?.tokens || 0,
           creditsCharged:
@@ -1670,8 +1720,8 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         openaiPurchasedUsd: purchasedUsd,
         openaiUsedUsd: Number(openaiUsedUsd.toFixed(6)),
         openaiTodayUsd: Number(openaiTodayUsd.toFixed(6)),
-        geminiUsedUsd: Number(geminiUsedUsd.toFixed(6)),
-        geminiTodayUsd: Number(geminiTodayUsd.toFixed(6)),
+        googleUsedUsd: Number(googleUsedUsd.toFixed(6)),
+        googleTodayUsd: Number(googleTodayUsd.toFixed(6)),
         totalProviderUsedUsd,
         todayProviderUsedUsd,
         openaiRemainingEstimatedUsd: remainingEstimatedUsd,
@@ -1679,7 +1729,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
         monthlySpendLimitUsd: config.openaiWallet.monthlySpendLimitUsd,
         totalTokensUsed,
         walletSourceLabel:
-          'Separate Provider Metering (OpenAI USD vs. Google Gemini USD · Reconciled Against Daily & Monthly Caps)',
+          'Official Google Gemini & OpenAI API Metering (Reconciled Against Daily & Monthly USD Caps)',
       },
       creditPool: {
         totalAssigned: poolTotalAssigned,
@@ -1736,7 +1786,7 @@ export async function buildAdminDashboardData(): Promise<AdminDashboardDTO> {
           searchCredits: Math.max(0, agg.search),
           voiceCredits: Math.max(0, agg.voice),
           openaiUsdCost: pAgg?.openaiUsdCost || 0,
-          geminiUsdCost: pAgg?.geminiUsdCost || 0,
+          googleUsdCost: pAgg?.googleUsdCost || 0,
           totalUsdCost: pAgg?.usdCost || 0,
           totalTokens: pAgg?.tokens || 0,
           apiRequests: pAgg?.requests || 0,

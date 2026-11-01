@@ -212,12 +212,7 @@ export function ChatWorkspaceView({
     (m) => m.enabled
   );
   const selectableModels = [
-    ...enabledModels.filter(
-      (m) => m.provider === 'openai' && m.available !== false
-    ),
-    ...enabledModels.filter(
-      (m) => m.provider !== 'openai' && m.available !== false
-    ),
+    ...enabledModels.filter((m) => m.available !== false),
     ...enabledModels.filter((m) => m.available === false),
   ];
 
@@ -227,10 +222,12 @@ export function ChatWorkspaceView({
     workspace.config.models[0];
 
   const showOpenAISecretSetup =
-    activeModelConfig?.provider === 'openai' &&
-    (!workspace.capabilities.openaiConfigured || missingOpenAISecret);
+    !(
+      workspace.capabilities.googleConfigured ||
+      workspace.capabilities.openaiConfigured
+    ) || Boolean(missingOpenAISecret);
 
-  const compactModelName = (activeModelConfig?.label || 'QAAGA Flash')
+  const compactModelName = (activeModelConfig?.label || 'Gemini 3.1 Flash Lite')
     .replace(/\s*\(.*?\)\s*/g, '')
     .trim();
 
@@ -604,11 +601,10 @@ export function ChatWorkspaceView({
                             </p>
                             <p className="text-[11px] text-slate-400 font-mono tabular-nums">
                               {m.baseCreditCost} cr ·{' '}
-                              {m.provider === 'openai' ? 'OpenAI' : 'Gemini'}
-                              {m.provider === 'openai' &&
-                              !workspace.capabilities.openaiConfigured
-                                ? ' · Needs OPENAI_API_KEY'
-                                : ''}
+                              {m.provider === 'google'
+                                ? 'Google Gemini'
+                                : 'OpenAI'}
+                              {m.available === false ? ' · Unverified' : ''}
                             </p>
                           </div>
                           {selected && (
@@ -755,17 +751,20 @@ export function ChatWorkspaceView({
             </div>
             <div className="space-y-1">
               <h3 className="font-heading font-semibold text-xs sm:text-sm text-amber-950 dark:text-amber-100">
-                OpenAI API Secret Setup Required
+                AI Provider Secret Setup Required
               </h3>
               <p className="text-xs leading-relaxed text-amber-900/90 dark:text-amber-200/90">
+                Neither{' '}
+                <code className="font-mono font-semibold px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/70">
+                  GEMINI_API_KEY
+                </code>{' '}
+                nor{' '}
                 <code className="font-mono font-semibold px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/70">
                   OPENAI_API_KEY
                 </code>{' '}
-                {workspace.capabilities.openaiConfigured
-                  ? 'was rejected by OpenAI (HTTP 401 Invalid API Key).'
-                  : 'is missing on the server.'}{' '}
-                To connect live OpenAI Responses API chat securely without
-                exposing secrets in the browser:
+                is configured on the server. To connect live Google Gemini or
+                OpenAI streaming chat securely without exposing secrets in the
+                browser:
               </p>
               <ol className="list-decimal list-inside text-[11.5px] leading-relaxed text-amber-900/85 dark:text-amber-200/85 space-y-0.5 pt-0.5">
                 <li>
@@ -774,14 +773,10 @@ export function ChatWorkspaceView({
                 </li>
                 <li>
                   Add{' '}
+                  <code className="font-mono font-semibold">GEMINI_API_KEY</code>{' '}
+                  (Google Gemini) and/or{' '}
                   <code className="font-mono font-semibold">OPENAI_API_KEY</code>{' '}
-                  with your official OpenAI API key (optional:{' '}
-                  <code className="font-mono font-semibold">OPENAI_MODEL</code>,
-                  default{' '}
-                  <code className="font-mono">
-                    {workspace.defaultOpenAIModel || 'gpt-4o-mini'}
-                  </code>
-                  ).
+                  (OpenAI).
                 </li>
                 <li>
                   Save the secret, then click <strong>Check Connection</strong>{' '}
@@ -1603,7 +1598,7 @@ export function ImageStudioPanel({
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-heading font-bold text-slate-900 dark:text-white">
-            1. Generate New Image (OpenAI DALL-E 3)
+            1. Generate New Image (Google Gemini + OpenAI)
           </h2>
           <span
             className={`text-xs font-semibold ${
@@ -1613,8 +1608,8 @@ export function ImageStudioPanel({
             }`}
           >
             {workspace.capabilities.features.imageGeneration.available
-              ? 'Active · OpenAI DALL-E 3'
-              : 'Unconfigured · Requires Valid OPENAI_API_KEY'}
+              ? `Active · ${workspace.capabilities.features.imageGeneration.provider}`
+              : 'Unconfigured · Requires GEMINI_API_KEY or OPENAI_API_KEY'}
           </span>
         </div>
 
@@ -1914,12 +1909,9 @@ export function VoiceConversationPanel({
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
-  // Realtime Duplex WebSocket Voice State
+  // Realtime Duplex WebSocket Voice State (OpenAI Realtime API)
   const [realtimeActive, setRealtimeActive] = useState(false);
   const [realtimeConnecting, setRealtimeConnecting] = useState(false);
-  const [realtimeProvider, setRealtimeProvider] = useState<'gemini' | 'openai'>(
-    workspace.capabilities.openaiLiveVerified ? 'openai' : 'gemini'
-  );
   const [realtimeError, setRealtimeError] = useState<string | null>(null);
   const [realtimeTranscripts, setRealtimeTranscripts] = useState<
     Array<{ role: 'user' | 'assistant'; text: string }>
@@ -2026,7 +2018,7 @@ export function VoiceConversationPanel({
       const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
       const wsUrl = `${proto}://${window.location.host}/api/realtime/voice?token=${encodeURIComponent(
         authToken
-      )}&provider=${realtimeProvider}`;
+      )}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -2213,24 +2205,13 @@ export function VoiceConversationPanel({
           </div>
 
           <div className="flex items-center gap-2">
-            <select
-              value={realtimeProvider}
-              disabled={realtimeActive || realtimeConnecting}
-              onChange={(e) =>
-                setRealtimeProvider(e.target.value as 'gemini' | 'openai')
-              }
-              className="px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100"
-            >
-              {workspace.capabilities.geminiConfigured && (
-                <option value="gemini">Google Gemini 3.8 Live (Ready)</option>
-              )}
-              <option value="openai">
-                OpenAI Realtime API{' '}
-                {workspace.capabilities.openaiLiveVerified
-                  ? '(Ready)'
-                  : '(Requires Valid OPENAI_API_KEY)'}
-              </option>
-            </select>
+            <span className="px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200">
+              {workspace.capabilities.features.realtimeVoice?.provider ||
+                'Google Gemini Live / OpenAI Realtime'}{' '}
+              {workspace.capabilities.features.realtimeVoice?.available
+                ? '(Ready)'
+                : '(Unconfigured)'}
+            </span>
 
             {realtimeActive || realtimeConnecting ? (
               <button

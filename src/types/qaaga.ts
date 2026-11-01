@@ -100,16 +100,20 @@ export interface PaymentRequestDTO {
   createdAt: string;
 }
 
+export type AIProviderId = 'google' | 'openai';
+
 export type ModelTier =
+  | 'google-reasoning'
+  | 'google-standard'
+  | 'google-economical'
   | 'openai-reasoning'
   | 'openai-standard'
-  | 'openai-economical'
-  | 'gemini';
+  | 'openai-economical';
 
 export interface ModelConfigItem {
   id: string;
   label: string;
-  provider: 'openai' | 'gemini' | 'bridge';
+  provider: AIProviderId;
   tier?: ModelTier;
   category: 'chat' | 'reasoning' | 'image' | 'audio';
   enabled: boolean;
@@ -181,7 +185,37 @@ export interface OpenAIAccountDiscoveryDTO {
   };
 }
 
+export interface GoogleAccountDiscoveryDTO {
+  checkedAt: string;
+  keyPresent: boolean;
+  reachable: boolean;
+  status: number | null;
+  errorCode: string | null;
+  message: string;
+  totalModelsCount: number;
+  categorizedModels: {
+    reasoning: string[];
+    standard: string[];
+    economical: string[];
+    image: string[];
+    audio: string[];
+    realtime: string[];
+    search: string[];
+  };
+}
+
 export interface ProviderDiagnosticsDTO {
+  google?: {
+    ok: boolean;
+    keyPresent: boolean;
+    status: number | null;
+    errorCode: string | null;
+    message: string;
+    latencyMs: number;
+    availableTargetModels: string[];
+    categorizedModels: GoogleAccountDiscoveryDTO['categorizedModels'];
+    apiNote: string;
+  };
   openai: {
     ok: boolean;
     keyPresent: boolean;
@@ -193,28 +227,15 @@ export interface ProviderDiagnosticsDTO {
     categorizedModels: OpenAIAccountDiscoveryDTO['categorizedModels'];
     apiNote: string;
   };
-  gemini: {
-    ok: boolean;
-    keyPresent: boolean;
-    status: number | null;
-    errorCode: string | null;
-    message: string;
-    latencyMs: number;
-    availableModels: string[];
-  };
 }
 
 export interface ProviderCapabilitiesDTO {
+  googleConfigured?: boolean;
+  googleLiveVerified?: boolean;
+  googleDiscovery?: GoogleAccountDiscoveryDTO;
   openaiConfigured: boolean;
   openaiLiveVerified?: boolean;
-  geminiConfigured?: boolean;
-  geminiBridgeConfigured: boolean;
-  activeMode:
-    | 'multi-provider-live'
-    | 'openai-live'
-    | 'gemini-live'
-    | 'sandbox-bridge'
-    | 'demo-simulation';
+  activeMode: 'multi-live' | 'google-live' | 'openai-live' | 'unconfigured';
   openaiDiscovery?: OpenAIAccountDiscoveryDTO;
   features: {
     chatStreaming: { available: boolean; provider: string; note: string };
@@ -282,6 +303,7 @@ export interface WorkspacePayload {
   }>;
   config: PlatformConfigDTO;
   capabilities: ProviderCapabilitiesDTO;
+  defaultGoogleModel?: string;
   defaultOpenAIModel?: string;
 }
 
@@ -328,8 +350,8 @@ export interface AdminDashboardDTO {
     openaiPurchasedUsd: number;
     openaiUsedUsd: number;
     openaiTodayUsd: number;
-    geminiUsedUsd: number;
-    geminiTodayUsd: number;
+    googleUsedUsd?: number;
+    googleTodayUsd?: number;
     totalProviderUsedUsd: number;
     todayProviderUsedUsd: number;
     openaiRemainingEstimatedUsd: number;
@@ -348,7 +370,7 @@ export interface AdminDashboardDTO {
     credits: number;
     usdCost: number;
     openaiUsdCost?: number;
-    geminiUsdCost?: number;
+    googleUsdCost?: number;
     tokens: number;
     requests: number;
   }>;
@@ -372,7 +394,7 @@ export interface AdminDashboardDTO {
     email: string;
     usdCost: number;
     openaiUsdCost: number;
-    geminiUsdCost: number;
+    googleUsdCost?: number;
     requests: number;
     tokens: number;
     creditsCharged: number;
@@ -397,7 +419,7 @@ export interface AdminDashboardDTO {
     searchCredits: number;
     voiceCredits: number;
     openaiUsdCost: number;
-    geminiUsdCost: number;
+    googleUsdCost?: number;
     totalUsdCost: number;
     totalTokens: number;
     apiRequests: number;

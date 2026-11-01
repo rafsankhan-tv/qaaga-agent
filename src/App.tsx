@@ -72,46 +72,88 @@ const FALLBACK_PUBLIC_CONFIG: PlatformConfigDTO = {
   },
   models: [
     {
+      id: 'gemini-3.1-flash-lite',
+      label: 'Gemini 3.1 Flash Lite (Fast)',
+      provider: 'google',
+      category: 'chat',
+      tier: 'google-economical',
+      enabled: true,
+      available: false,
+      inputUsdPer1M: 0.075,
+      outputUsdPer1M: 0.3,
+      baseCreditCost: 1,
+      creditsPer1kTokens: 1,
+      description: 'Ultra-fast Google Gemini assistant for everyday chat, vision, PDFs & Bengali.',
+    },
+    {
+      id: 'gemini-3.8-flash',
+      label: 'Gemini 3.8 Flash (Balanced)',
+      provider: 'google',
+      category: 'chat',
+      tier: 'google-standard',
+      enabled: true,
+      available: false,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 1,
+      creditsPer1kTokens: 1,
+      description: 'Balanced Google Gemini multimodal model with Google Search grounding.',
+    },
+    {
+      id: 'gemini-4-argon',
+      label: 'Gemini 4 Argon (Reasoning)',
+      provider: 'google',
+      category: 'reasoning',
+      tier: 'google-reasoning',
+      enabled: true,
+      available: false,
+      inputUsdPer1M: 1.25,
+      outputUsdPer1M: 5.0,
+      baseCreditCost: 3,
+      creditsPer1kTokens: 2,
+      description: 'Advanced Google Gemini reasoning model for STEM, coding & architecture.',
+    },
+    {
+      id: 'gpt-4o-mini',
+      label: 'GPT-4o mini (Fast)',
+      provider: 'openai',
+      category: 'chat',
+      tier: 'openai-economical',
+      enabled: true,
+      available: false,
+      inputUsdPer1M: 0.15,
+      outputUsdPer1M: 0.6,
+      baseCreditCost: 1,
+      creditsPer1kTokens: 1,
+      description: 'Fast, cost-efficient OpenAI assistant for everyday chat, vision & PDFs.',
+    },
+    {
       id: 'gpt-4o',
       label: 'GPT-4o (Flagship)',
       provider: 'openai',
       category: 'chat',
       tier: 'openai-standard',
       enabled: true,
-      available: true,
+      available: false,
       inputUsdPer1M: 2.5,
       outputUsdPer1M: 10.0,
       baseCreditCost: 2,
       creditsPer1kTokens: 2,
-      description: 'Flagship multimodal reasoning & coding assistant.',
+      description: 'Flagship OpenAI multimodal reasoning & coding assistant.',
     },
     {
-      id: 'gemini-3.1-flash-lite',
-      label: 'Gemini 3.1 Flash-Lite',
-      provider: 'gemini',
+      id: 'o3-mini',
+      label: 'OpenAI o3-mini (Reasoning)',
+      provider: 'openai',
       category: 'chat',
-      tier: 'gemini',
+      tier: 'openai-reasoning',
       enabled: true,
-      available: true,
-      inputUsdPer1M: 0.075,
-      outputUsdPer1M: 0.3,
-      baseCreditCost: 1,
-      creditsPer1kTokens: 1,
-      description: 'Economical low-latency assistant.',
-    },
-    {
-      id: 'gemini-3.8-flash',
-      label: 'Gemini 3.8 Flash',
-      provider: 'gemini',
-      category: 'chat',
-      tier: 'gemini',
-      enabled: true,
-      available: true,
-      inputUsdPer1M: 0.3,
-      outputUsdPer1M: 2.5,
-      baseCreditCost: 2,
-      creditsPer1kTokens: 1,
-      description: 'High-speed multimodal reasoning, PDF & grounded search.',
+      available: false,
+      inputUsdPer1M: 1.1,
+      outputUsdPer1M: 4.4,
+      baseCreditCost: 3,
+      creditsPer1kTokens: 2,
+      description: 'Deep step-by-step OpenAI reasoning model for math, logic & architecture.',
     },
   ],
 };
@@ -124,21 +166,21 @@ const FALLBACK_PACKAGES: RechargePackageDTO[] = [
 ];
 
 const FALLBACK_CAPABILITIES: ProviderCapabilitiesDTO = {
-  openaiConfigured: true,
+  googleConfigured: false,
+  googleLiveVerified: false,
+  openaiConfigured: false,
   openaiLiveVerified: false,
-  geminiConfigured: true,
-  geminiBridgeConfigured: true,
-  activeMode: 'gemini-live',
+  activeMode: 'unconfigured',
   features: {
-    chatStreaming: { available: true, provider: 'Google Gemini API', note: 'Streaming ready' },
-    reasoning: { available: true, provider: 'Google Gemini API', note: 'Thinking mode ready' },
-    imageGeneration: { available: false, provider: 'OpenAI DALL-E 3', note: 'Requires live OpenAI API key' },
-    imageAnalysis: { available: true, provider: 'Google Gemini Vision', note: 'Vision analysis ready' },
-    pdfAnalysis: { available: true, provider: 'Google Gemini Multimodal', note: 'PDF analysis ready' },
-    webSearch: { available: true, provider: 'Google Search Grounding', note: 'Web grounding ready' },
-    speechToText: { available: true, provider: 'Gemini 3.5 Transcribe', note: 'Speech recognition ready' },
-    textToSpeech: { available: true, provider: 'Gemini 3.8 TTS', note: 'Neural speech ready' },
-    realtimeVoice: { available: true, provider: 'Gemini 3.8 Live Audio', note: 'Duplex voice ready' },
+    chatStreaming: { available: false, provider: 'Google Gemini + OpenAI', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    reasoning: { available: false, provider: 'Google Gemini + OpenAI Reasoning', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    imageGeneration: { available: false, provider: 'Google Gemini + OpenAI Image', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    imageAnalysis: { available: false, provider: 'Google Gemini + OpenAI Vision', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    pdfAnalysis: { available: false, provider: 'Google Gemini + OpenAI PDF', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    webSearch: { available: false, provider: 'Google Search + OpenAI Web Search', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    speechToText: { available: false, provider: 'Google Gemini + OpenAI STT', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    textToSpeech: { available: false, provider: 'Google Gemini + OpenAI TTS', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
+    realtimeVoice: { available: false, provider: 'Google Gemini Live + OpenAI Realtime', note: 'Requires GEMINI_API_KEY or OPENAI_API_KEY' },
   },
 };
 
@@ -158,11 +200,13 @@ function QaagaAppShell() {
     config: PlatformConfigDTO;
     packages: RechargePackageDTO[];
     capabilities: ProviderCapabilitiesDTO;
+    defaultGoogleModel: string;
     defaultOpenAIModel: string;
   }>({
     config: FALLBACK_PUBLIC_CONFIG,
     packages: FALLBACK_PACKAGES,
     capabilities: FALLBACK_CAPABILITIES,
+    defaultGoogleModel: 'gemini-3.1-flash-lite',
     defaultOpenAIModel: 'gpt-4o-mini',
   });
   const [guestTheme, setGuestTheme] = useState<'light' | 'dark'>('light');
@@ -244,43 +288,41 @@ function QaagaAppShell() {
       if (data && data.config && data.packages) {
         const caps: ProviderCapabilitiesDTO =
           data.capabilities || FALLBACK_CAPABILITIES;
-        const serverModel = String(
+        const serverGoogleModel = String(
+          data.defaultGoogleModel || 'gemini-3.1-flash-lite'
+        ).trim();
+        const serverOpenAIModel = String(
           data.defaultOpenAIModel || 'gpt-4o-mini'
         ).trim();
         setPublicMeta({
           config: data.config,
           packages: data.packages,
           capabilities: caps,
-          defaultOpenAIModel: serverModel,
+          defaultGoogleModel: serverGoogleModel,
+          defaultOpenAIModel: serverOpenAIModel,
         });
-        setMissingOpenAISecret(!caps.openaiConfigured);
+        setMissingOpenAISecret(
+          !(caps.googleConfigured || caps.openaiConfigured)
+        );
 
         const enabledModels = (data.config as PlatformConfigDTO).models.filter(
           (m) => m.enabled
         );
         const liveModels = enabledModels.filter((m) => m.available !== false);
+        const pool = liveModels.length > 0 ? liveModels : enabledModels;
 
-        if (caps.openaiLiveVerified) {
-          const preferredOpenAI =
-            liveModels.find(
-              (m) => m.id === serverModel && m.provider === 'openai'
-            ) ||
-            liveModels.find((m) => m.provider === 'openai') ||
-            liveModels[0];
-          if (preferredOpenAI) {
+        if (pool.length > 0) {
+          const preferredDefault =
+            pool.find((m) => m.id === serverGoogleModel) ||
+            pool.find((m) => m.id === serverOpenAIModel) ||
+            pool.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+            pool.find((m) => m.id === 'gpt-4o-mini') ||
+            pool[0];
+          if (preferredDefault) {
             setSelectedModelId((prev) =>
-              liveModels.some((m) => m.id === prev && m.provider === 'openai')
-                ? prev
-                : preferredOpenAI.id
+              pool.some((m) => m.id === prev) ? prev : preferredDefault.id
             );
           }
-        } else if (liveModels.length > 0) {
-          const fastLive =
-            liveModels.find((m) => m.id === 'gemini-3.1-flash-lite') ||
-            liveModels[0];
-          setSelectedModelId((prev) =>
-            liveModels.some((m) => m.id === prev) ? prev : fastLive.id
-          );
         }
         return data;
       }
@@ -385,40 +427,33 @@ function QaagaAppShell() {
       const payload = data as WorkspacePayload;
       setWorkspace(payload);
       setUser(payload.user);
-      setMissingOpenAISecret(!payload.capabilities.openaiConfigured);
+      setMissingOpenAISecret(
+        !(
+          payload.capabilities.googleConfigured ||
+          payload.capabilities.openaiConfigured
+        )
+      );
       setSelectedModelId((prev) => {
         const enabled = payload.config.models.filter((m) => m.enabled);
         const live = enabled.filter((m) => m.available !== false);
-        const serverModel = payload.defaultOpenAIModel || 'gpt-4o-mini';
+        const pool = live.length > 0 ? live : enabled;
+        const serverGoogle =
+          payload.defaultGoogleModel || 'gemini-3.1-flash-lite';
+        const serverOpenAI = payload.defaultOpenAIModel || 'gpt-4o-mini';
 
-        if (payload.capabilities.openaiLiveVerified) {
-          if (live.some((m) => m.id === prev && m.provider === 'openai')) {
-            return prev;
-          }
-          if (
-            live.some(
-              (m) =>
-                m.id === payload.user.preferredModel && m.provider === 'openai'
-            )
-          ) {
-            return payload.user.preferredModel;
-          }
-          const openAiLive =
-            live.find((m) => m.id === serverModel && m.provider === 'openai') ||
-            live.find((m) => m.provider === 'openai') ||
-            live[0];
-          return openAiLive?.id || serverModel;
+        if (pool.some((m) => m.id === prev)) {
+          return prev;
         }
-
-        if (live.some((m) => m.id === prev)) return prev;
-        if (live.some((m) => m.id === payload.user.preferredModel)) {
+        if (pool.some((m) => m.id === payload.user.preferredModel)) {
           return payload.user.preferredModel;
         }
-        const fastLive =
-          live.find((m) => m.id === 'gemini-3.1-flash-lite') ||
-          live[0] ||
-          enabled[0];
-        return fastLive?.id || 'gemini-3.1-flash-lite';
+        const preferred =
+          pool.find((m) => m.id === serverGoogle) ||
+          pool.find((m) => m.id === serverOpenAI) ||
+          pool.find((m) => m.id === 'gemini-3.1-flash-lite') ||
+          pool.find((m) => m.id === 'gpt-4o-mini') ||
+          pool[0];
+        return preferred?.id || serverGoogle;
       });
 
       if (payload.user.role === 'admin' && payload.user.status === 'ACTIVE') {
@@ -572,6 +607,7 @@ function QaagaAppShell() {
       notifications: [],
       config: publicMeta.config,
       capabilities: publicMeta.capabilities,
+      defaultGoogleModel: publicMeta.defaultGoogleModel,
       defaultOpenAIModel: publicMeta.defaultOpenAIModel,
     }),
     [guestSession, guestTheme, publicMeta, selectedModelId]
@@ -585,15 +621,13 @@ function QaagaAppShell() {
     }
   }, [fetchWorkspace, loadFrontpageMeta, token]);
 
-  // Front-Page Guest Free Text Chat Executor (Non-chat commands prompt Login; explicit OpenAI without key shows Secret Setup)
+  // Front-Page Guest Chat Handler
   const executeGuestStreamChat = async (opts?: {
     customPrompt?: string;
     regenerateLast?: boolean;
   }) => {
     let promptToSend =
       opts?.customPrompt !== undefined ? opts.customPrompt : chatInput;
-
-    let historySnapshot = guestMessages;
 
     if (opts?.regenerateLast) {
       const reversedUserIdx = [...guestMessages]
@@ -602,7 +636,6 @@ function QaagaAppShell() {
       if (reversedUserIdx === -1) return;
       const lastUserIdx = guestMessages.length - 1 - reversedUserIdx;
       promptToSend = guestMessages[lastUserIdx].content;
-      historySnapshot = guestMessages.slice(0, lastUserIdx);
     }
 
     if (!promptToSend.trim()) return;
@@ -613,168 +646,21 @@ function QaagaAppShell() {
       return;
     }
 
-    const chosenGuestModel = publicMeta.config.models.find(
-      (m) => m.id === selectedModelId
-    );
-    if (chosenGuestModel?.provider === 'openai') {
-      if (!publicMeta.capabilities.openaiConfigured) {
-        setMissingOpenAISecret(true);
-        setStreamError(
-          'OPENAI_API_KEY is not configured on the server. Replace the placeholder OPENAI_API_KEY in AI Studio Settings > Secrets, or switch to a live model.'
-        );
-        return;
-      }
-      // OpenAI POST /api/chat is protected by user authentication & per-user rate limits
-      setChatInput(promptToSend.trim());
-      openLoginModal('OpenAI Chat', 'chat');
+    if (
+      !(
+        publicMeta.capabilities.googleConfigured ||
+        publicMeta.capabilities.openaiConfigured
+      )
+    ) {
+      setMissingOpenAISecret(true);
+      setStreamError(
+        'Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured on the server. Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets, then click Check Connection.'
+      );
       return;
     }
 
-    const userMsg: ChatMessageDTO = {
-      id: Date.now(),
-      sessionId: -1,
-      role: 'user',
-      content: promptToSend.trim(),
-      model: selectedModelId,
-      mode: 'chat',
-      attachments: [],
-      citations: [],
-      imageDataUrl: null,
-      creditsCharged: 0,
-      tokensUsed: 0,
-      createdAt: new Date().toISOString(),
-    };
-
-    const updatedHistory = [...historySnapshot, userMsg];
-    setGuestMessages(updatedHistory);
-    if (opts?.customPrompt === undefined && !opts?.regenerateLast) {
-      setChatInput('');
-    }
-
-    setIsStreaming(true);
-    setStreamingText('');
-    setStreamError(null);
-
-    let finalReplyText = '';
-
-    try {
-      const res = await fetch('/api/public/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: promptToSend.trim(),
-          modelId: selectedModelId,
-          reasoningEffort,
-          webSearch: false,
-          attachments: [],
-          history: historySnapshot.slice(-10).map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
-
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        if (res.status === 401 || errJson.code === 'LOGIN_REQUIRED') {
-          setGuestMessages(historySnapshot);
-          setChatInput(promptToSend);
-          openLoginModal('Advanced AI Command', 'chat');
-          return;
-        }
-        if (res.status === 503 && errJson.code === 'OPENAI_SECRET_MISSING') {
-          setGuestMessages(historySnapshot);
-          setChatInput(promptToSend);
-          setMissingOpenAISecret(true);
-          setStreamError(errJson.error || 'OPENAI_API_KEY is missing.');
-          return;
-        }
-        throw new Error(errJson.error || 'Guest chat request failed.');
-      }
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error('Streaming unavailable.');
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      const processGuestFrame = (frame: string) => {
-        const line = frame
-          .split('\n')
-          .find((l) => l.startsWith('data: '));
-        if (!line) return;
-
-        let event: { type?: string; text?: string; error?: string } | null =
-          null;
-        try {
-          event = JSON.parse(line.slice(6));
-        } catch {
-          return;
-        }
-        if (!event) return;
-
-        if (event.type === 'delta' && event.text) {
-          finalReplyText += String(event.text);
-          setStreamingText(finalReplyText);
-        } else if (event.type === 'error') {
-          throw new Error(event.error || 'Guest chat streaming error.');
-        }
-      };
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          buffer += decoder.decode();
-          if (buffer.trim()) {
-            for (const trailing of buffer.split('\n\n')) {
-              processGuestFrame(trailing);
-            }
-          }
-          break;
-        }
-        buffer += decoder.decode(value, { stream: true });
-
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop() || '';
-
-        for (const frame of parts) {
-          processGuestFrame(frame);
-        }
-      }
-
-      if (finalReplyText.trim()) {
-        const assistantMsg: ChatMessageDTO = {
-          id: Date.now() + 1,
-          sessionId: -1,
-          role: 'assistant',
-          content: finalReplyText,
-          model: selectedModelId,
-          mode: 'chat',
-          attachments: [],
-          citations: [],
-          imageDataUrl: null,
-          creditsCharged: 0,
-          tokensUsed: 0,
-          createdAt: new Date().toISOString(),
-        };
-        setGuestMessages((prev) => [...prev, assistantMsg]);
-      } else {
-        throw new Error(
-          'Empty response received. Please try sending your message again.'
-        );
-      }
-    } catch (err: unknown) {
-      if (!finalReplyText.trim()) {
-        setGuestMessages(historySnapshot);
-        setChatInput(promptToSend);
-      }
-      setStreamError(
-        err instanceof Error ? err.message : 'Guest chat interrupted.'
-      );
-    } finally {
-      setIsStreaming(false);
-      setStreamingText('');
-    }
+    setChatInput(promptToSend.trim());
+    openLoginModal('AI Chat', 'chat');
   };
 
   // Suspended Account Gate (Only SUSPENDED accounts are locked out; PENDING/0-credit accounts enter workspace & see Recharge prompt on commands)
@@ -974,18 +860,15 @@ function QaagaAppShell() {
         content: m.content,
       }));
 
-    const selectedModelMeta = effectiveWorkspace.config.models.find(
-      (m) => m.id === selectedModelId
-    );
-    const isExplicitGeminiModel = selectedModelMeta?.provider === 'gemini';
-
     if (
-      !isExplicitGeminiModel &&
-      !effectiveWorkspace.capabilities.openaiConfigured
+      !(
+        effectiveWorkspace.capabilities.googleConfigured ||
+        effectiveWorkspace.capabilities.openaiConfigured
+      )
     ) {
       setMissingOpenAISecret(true);
       setStreamError(
-        'OPENAI_API_KEY is not configured on the server. Add OPENAI_API_KEY in AI Studio Settings > Secrets to send OpenAI chat messages.'
+        'Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured on the server. Add GEMINI_API_KEY or OPENAI_API_KEY in AI Studio Settings > Secrets to send chat messages.'
       );
       return;
     }
@@ -1110,13 +993,9 @@ function QaagaAppShell() {
     let finalReplyText = '';
     let resolvedSessionId = activeSessionId ?? tempSessionId;
 
-    // Route OpenAI chat directly to POST /api/chat (official OpenAI Responses API; never falls back to Gemini)
-    const targetEndpoint = isExplicitGeminiModel
-      ? '/api/chat/stream'
-      : '/api/chat';
-
+    // Route all authenticated chat directly to POST /api/chat (official OpenAI Responses API)
     try {
-      const res = await authFetch(targetEndpoint, {
+      const res = await authFetch('/api/chat', {
         method: 'POST',
         body: JSON.stringify({
           sessionId: activeSessionId && activeSessionId > 0 ? activeSessionId : null,
@@ -1319,15 +1198,6 @@ function QaagaAppShell() {
     }
   };
 
-  const activeModelObj = effectiveWorkspace.config.models.find(
-    (m) => m.id === selectedModelId
-  );
-  const preferredAudioProvider: 'openai' | 'gemini' =
-    activeModelObj?.provider === 'openai' &&
-    effectiveWorkspace.capabilities.openaiLiveVerified
-      ? 'openai'
-      : 'gemini';
-
   const handleTranscribeBlob = async (
     base64Audio: string,
     mimeType: string
@@ -1341,11 +1211,13 @@ function QaagaAppShell() {
       body: JSON.stringify({
         base64Audio,
         mimeType,
-        provider: preferredAudioProvider,
       }),
     });
     const data = await res.json();
     if (!res.ok) {
+      if (res.status === 503 && data.code === 'OPENAI_SECRET_MISSING') {
+        setMissingOpenAISecret(true);
+      }
       if (res.status === 402 || data.code === 'RECHARGE_REQUIRED') {
         openRechargeModal(
           data.error || 'Please recharge your account to use Voice Input.'
@@ -1375,7 +1247,6 @@ function QaagaAppShell() {
         body: JSON.stringify({
           text: text.slice(0, 1500),
           voice: effectiveWorkspace.user.preferredVoice,
-          provider: preferredAudioProvider,
         }),
       });
       const data = await res.json();
